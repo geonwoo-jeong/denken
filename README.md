@@ -19,26 +19,47 @@ npx skills add geonwoo-jeong/denken --skill <name> -g -a claude-code
 
 | Skill | Description |
 | ----- | ----------- |
-| [denken](skills/denken/SKILL.md) | Master orchestrator. Takes a task through plan → develop → independent QA → wiki, with a review loop at each stage, and delivers only approved results. |
+| [denken](skills/denken/SKILL.md) | Master orchestrator. Takes a task through plan → develop → independent QA → wiki. Each stage's work is reviewed read-only by a different AI, and only approved results are delivered. |
 
 ### The DENKEN team
 
 ```text
-user ⇄ DENKEN ─▶ PLAN     METHODE ⇄ RICHTER
-               ─▶ DEVELOP  STARK   ⇄ RICHTER   ◀─ QA failure
-               ─▶ QA       GENAU (separate agent: Claude, Codex, ...)
-               ─▶ WIKI     SERIE   ⇄ RICHTER
-               ─▶ DONE     approved results only
+user ⇄ DENKEN ─▶ plan  METHODE ⇄ RICHTER
+               ─▶ dev   STARK   ⇄ RICHTER   ◀─ QA failure
+               ─▶ qa    GENAU
+               ─▶ wiki  SERIE   ⇄ RICHTER
+               ─▶ done  approved results only
 ```
 
-| Name | Role |
-| ---- | ---- |
-| DENKEN | Master / orchestrator: the only agent the user talks to |
-| METHODE | Planning worker |
-| RICHTER | Reviewer for plan, development and wiki |
-| STARK | Development worker |
-| GENAU | Independent QA, run as a separate agent process |
-| SERIE | Wiki / knowledge worker |
+| Name | Role | Default provider |
+| ---- | ---- | ---------------- |
+| DENKEN | Master / orchestrator: the only agent the user talks to | the agent you run it in |
+| METHODE | Planning worker | Claude |
+| STARK | Development worker | Codex |
+| SERIE | Wiki / knowledge worker | Claude |
+| RICHTER | Read-only reviewer for plan, dev and wiki | the other provider from the stage's worker |
+| GENAU | Independent QA | the other provider from STARK |
+
+How it works:
+
+- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent only does intake, rules on disputes and talks to you.
+- **Read-only review:** reviewers are read-only. Claude gets only Read, Grep and Glob; Codex runs in its read-only sandbox. A review that changes a file is rejected.
+- **Approval gate:** a stage moves on only after its review has no blocking findings.
+- **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
+- **Single provider:** with only Claude or only Codex installed, everything runs on that provider.
+
+### Choosing which AI plays each role
+
+Requires the [Claude Code](https://code.claude.com) and/or [Codex](https://developers.openai.com/codex) CLI, installed and logged in. The first time DENKEN runs in a project, it proposes an assignment and asks you to confirm it. You can change it at any time, either by asking DENKEN ("configure denken") or directly:
+
+```bash
+S=.claude/skills/denken/scripts        # or wherever the skill was installed, e.g. .agents/skills/denken
+node $S/config.mjs                     # show the assignment and provider status
+node $S/config.mjs set stark claude    # Claude develops; its reviewer and QA switch to Codex
+node $S/config.mjs set stark.model <model> --local
+```
+
+`.denken/config.json` is shared with your team. `.denken/config.local.json` (`--local`) and `~/.config/denken/config.json` (`--global`) hold personal overrides.
 
 ## Development
 
@@ -47,6 +68,7 @@ Requires Node.js 20 or later. There are no dependencies to install.
 ```bash
 npm run new -- my-skill                                  # scaffold skills/my-skill/SKILL.md
 npm run validate                                         # check every skill
+npm test                                                 # run-engine tests (fake agent CLIs, no API calls)
 npx skills add . --list                                  # confirm the CLI discovers it
 npx skills use ./ --skill my-skill --agent claude-code   # try it without installing
 ```
@@ -58,6 +80,7 @@ skills/<name>/scripts/       optional: executable helpers
 skills/<name>/assets/        optional: templates and static files
 template/                    scaffold used by `npm run new` (not published)
 scripts/                     repository tooling (not published)
+tests/                       tests for skill scripts (not published)
 ```
 
 [AGENTS.md](AGENTS.md) covers the authoring conventions.

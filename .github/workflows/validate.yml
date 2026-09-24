@@ -14,3 +14,4 @@ jobs:
         with:
           node-version: 22
       - run: npm run validate
+      - run: npm test

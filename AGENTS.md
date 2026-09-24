@@ -6,6 +6,7 @@ This repository publishes [Agent Skills](https://agentskills.io). Each skill liv
 
 - `npm run new -- <name>`: scaffold `skills/<name>/SKILL.md` from `template/SKILL.template.md`
 - `npm run validate`: spec and convention checks for every skill. Run it before you call a change done.
+- `npm test`: tests for skill scripts, using fake agent CLIs, so no API calls are made. Run it after changing anything under `skills/*/scripts/`.
 - `npx skills add . --list`: confirm the CLI discovers the skill
 - `npx skills use ./ --skill <name> --agent claude-code`: try a skill in a fresh agent session without installing it
 
