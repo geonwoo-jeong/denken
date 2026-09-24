@@ -11,7 +11,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = join(here, "..", "skills", "denken", "scripts");
 const FAKE = join(here, "fake-agent.mjs");
 
-const finding = (topic, extra = {}) => ({ severity: "blocking", topic, file: "src.txt", line_start: 1, line_end: 1, criterion: null, problem: `${topic} problem`, required_change: `fix ${topic}`, ...extra });
+const SPEC = "# Spec: test\n\n## Goal\nTest.\n\n## In scope\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Out of scope\n- X1. Three.\n";
+const finding = (topic, extra = {}) => ({ severity: "blocking", topic, file: "src.txt", line_start: 1, line_end: 1, spec_item: null, todo: null, problem: `${topic} problem`, required_change: `fix ${topic}`, ...extra });
+const qaItem = (id, result = "PASS", extra = {}) => ({ id, spec_item: id, check: `check ${id}`, how_verified: "x", result, evidence: result === "PASS" ? "ok" : "boom", reproduce: result === "PASS" ? null : "npm test", ...extra });
 const changes = (...findings) => ({ review: { verdict: "CHANGES_REQUESTED", findings, checked: [] } });
 
 function setup(scenario = {}, config = null) {
@@ -48,11 +50,16 @@ function setup(scenario = {}, config = null) {
   const denken = (...args) => node("denken.mjs", ...args);
   const created = denken("new", "test task").json;
   const run = created.run;
-  writeFileSync(join(proj, run, "brief.md"), "# Brief\n\n1. criterion one\n");
-  const drive = () => {
+  writeFileSync(join(proj, run, "spec.md"), SPEC);
+  // drive() confirms the TODO lists on the user's behalf unless told not to.
+  const drive = ({ autoConfirm = true } = {}) => {
     for (let i = 0; i < 20; i++) {
       const r = denken("next", run, "--wait", "60");
       if (!r.json) throw new Error(`next printed no JSON (exit ${r.status}): ${r.stdout}${r.stderr}`);
+      if (autoConfirm && r.json.reason === "confirm_todos") {
+        assert.equal(denken("confirm", run, "--user-said", "Looks good, go ahead.").json.action, "confirmed");
+        continue;
+      }
       if (r.json.action !== "running") return r.json;
     }
     throw new Error("run did not settle");
@@ -65,27 +72,27 @@ function setup(scenario = {}, config = null) {
 }
 
 test("happy path alternates providers and reviewers run read-only", () => {
-  const t = setup({ "plan-richter-1": changes(finding("scope", { file: "plan.md" })) });
+  const t = setup({ "plan-richter-1": changes(finding("scope", { file: "todo-dev.md" })) });
   assert.equal(t.denken("start", t.run).json.action, "started");
   const done = t.drive();
-  assert.equal(done.action, "done");
+  assert.equal(done.action, "done", JSON.stringify(done).slice(0, 600));
   assert.deepEqual(t.calls(), [
     "claude plan-methode-1 rw",
     "codex plan-richter-1 ro",
     "claude plan-methode-2 rw",
     "codex plan-richter-2 ro",
     "codex dev-stark-1 rw",
-    "claude dev-richter-1 ro",
+    "claude dev-ubel-1 ro",
     "claude qa-genau-1 rw",
     "claude wiki-serie-1 rw",
-    "codex wiki-richter-1 ro",
+    "codex wiki-frieren-1 ro",
   ]);
   assert.ok(Object.values(t.state().approved).every(Boolean));
   assert.ok(existsSync(join(t.proj, ".denken", ".gitignore")));
 });
 
 test("a topic raised three times asks DENKEN for a ruling; uphold continues the loop", () => {
-  const t = setup({ "dev-richter-1": changes(finding("error handling")), "dev-richter-2": changes(finding("Error-Handling")), "dev-richter-3": changes(finding("error-handling")) });
+  const t = setup({ "dev-ubel-1": changes(finding("error handling")), "dev-ubel-2": changes(finding("Error-Handling")), "dev-ubel-3": changes(finding("error-handling")) });
   t.denken("start", t.run);
   const ruling = t.drive();
   assert.equal(ruling.action, "needs_ruling");
@@ -99,7 +106,7 @@ test("a topic raised three times asks DENKEN for a ruling; uphold continues the 
 });
 
 test("dismissing the only open topic approves the stage", () => {
-  const t = setup({ "plan-richter-1": changes(finding("naming", { file: "plan.md" })), "plan-richter-2": changes(finding("naming", { file: "plan.md" })), "plan-richter-3": changes(finding("naming", { file: "plan.md" })) });
+  const t = setup({ "plan-richter-1": changes(finding("naming", { file: "todo-dev.md" })), "plan-richter-2": changes(finding("naming", { file: "todo-dev.md" })), "plan-richter-3": changes(finding("naming", { file: "todo-dev.md" })) });
   t.denken("start", t.run);
   assert.equal(t.drive().action, "needs_ruling");
   t.denken("rule", t.run, "--decision", "dismiss", "--note", "Naming is a preference, not a requirement.");
@@ -109,14 +116,18 @@ test("dismissing the only open topic approves the stage", () => {
 });
 
 test("QA failure sends work back to dev, which is reviewed again before QA reruns", () => {
-  const fail2 = { qa: { result: "FAIL", criteria: [{ id: 1, criterion: "c1", how_verified: "x", result: "PASS", evidence: "", reproduce: null }, { id: 2, criterion: "c2", how_verified: "x", result: "FAIL", evidence: "boom", reproduce: "npm test" }] } };
+  const fail2 = { qa: { result: "FAIL", items: [qaItem(1), qaItem(2, "FAIL")] } };
   const t = setup({ "qa-genau-1": fail2 });
   t.denken("start", t.run);
   assert.equal(t.drive().action, "done");
   const calls = t.calls();
-  assert.deepEqual(calls.slice(calls.indexOf("claude qa-genau-1 rw")), ["claude qa-genau-1 rw", "codex dev-stark-2 rw", "claude dev-richter-2 ro", "claude qa-genau-2 rw", "claude wiki-serie-1 rw", "codex wiki-richter-1 ro"]);
-  assert.equal(t.state().counts.dev["criterion-2"], 1);
-  assert.match(readFileSync(join(t.proj, t.run, "calls", "dev-stark-2.prompt.md"), "utf8"), /qa-genau-1\.out\.json/);
+  assert.deepEqual(calls.slice(calls.indexOf("claude qa-genau-1 rw")), ["claude qa-genau-1 rw", "codex dev-stark-2 rw", "claude dev-ubel-2 ro", "claude qa-genau-2 rw", "claude wiki-serie-1 rw", "codex wiki-frieren-1 ro"]);
+  assert.equal(t.state().counts.dev["spec-2"], 1);
+  // STARK gets only the failed checks, not the QA report or the QA TODO list.
+  const prompt = readFileSync(join(t.proj, t.run, "calls", "dev-stark-2.prompt.md"), "utf8");
+  assert.match(prompt, /qa-genau-1\.failures\.json/);
+  assert.doesNotMatch(prompt, /qa-genau-1\.out\.json|todo-qa\.md/);
+  assert.deepEqual(JSON.parse(readFileSync(join(t.proj, t.run, "calls", "qa-genau-1.failures.json"), "utf8")).map((f) => f.qa_item), ["Q2"]);
 });
 
 test("nonblocking findings are deferred and do not block approval", () => {
@@ -136,7 +147,7 @@ test("a stalled loop asks for a ruling even when topics differ", () => {
 });
 
 test("a reviewer that edits the project is rejected until the user resolves it", () => {
-  const t = setup({ "dev-richter-1": [{ touch: "a.txt" }, {}] });
+  const t = setup({ "dev-ubel-1": [{ touch: "a.txt" }, {}] });
   t.denken("start", t.run);
   const blocked = t.drive();
   assert.equal(blocked.action, "needs_user");
@@ -175,13 +186,13 @@ test("a reviewer that edits an ignored .env file is rejected; QA may rewrite oth
   assert.equal(q.drive().action, "done");
 });
 
-test("a dismissed criterion no longer fails QA", () => {
-  const fail = { qa: { result: "FAIL", criteria: [{ id: 1, criterion: "c1", how_verified: "x", result: "FAIL", evidence: "needs network", reproduce: "npm test" }] } };
+test("a dismissed spec item no longer fails QA", () => {
+  const fail = { qa: { result: "FAIL", items: [qaItem(1, "FAIL"), qaItem(2)] } };
   const t = setup({ "qa-genau-1": fail, "qa-genau-2": fail, "qa-genau-3": fail, "qa-genau-4": fail }, { limits: { topicRepeats: 2 } });
   t.denken("start", t.run);
   const r = t.drive();
   assert.equal(r.action, "needs_ruling");
-  assert.equal(r.identity, "criterion-1");
+  assert.equal(r.identity, "spec-1");
   t.denken("rule", t.run, "--decision", "dismiss", "--note", "Criterion 1 needs network access; out of scope for this environment.");
   assert.equal(t.drive().action, "done");
 });
@@ -215,7 +226,7 @@ test("output that does not match the schema is retried", () => {
 
 test("repeated permission denials in work calls stop the run", () => {
   const denial = { denials: [{ tool_name: "Bash", tool_input: { command: "curl example.com" } }] };
-  const t = setup({ "plan-methode-1": denial, "plan-richter-1": changes(finding("x", { file: "plan.md" })), "plan-methode-2": denial });
+  const t = setup({ "plan-methode-1": denial, "plan-richter-1": changes(finding("x", { file: "todo-dev.md" })), "plan-methode-2": denial });
   t.denken("start", t.run);
   assert.equal(t.drive().reason, "repeated_permission_denials");
   assert.match(readFileSync(join(t.proj, t.run, "calls", "plan-richter-1.prompt.md"), "utf8"), /1 action\(s\) blocked/);
@@ -223,7 +234,7 @@ test("repeated permission denials in work calls stop the run", () => {
 
 test("config: explicit worker/reviewer conflict is refused; single provider falls back with a warning", () => {
   const t = setup();
-  const conflict = t.node("config.mjs", "set", "richter.plan", "claude");
+  const conflict = t.node("config.mjs", "set", "richter", "claude");
   assert.equal(conflict.status, 1);
   assert.match(conflict.stderr, /reviewer must use a different provider/);
   assert.ok(!existsSync(join(t.proj, ".denken", "config.json")));
@@ -232,10 +243,9 @@ test("config: explicit worker/reviewer conflict is refused; single provider fall
   const r = t.node("config.mjs", "--json").json;
   assert.equal(r.crossProvider, false);
   assert.equal(r.stages.dev.reviewer.provider, "codex");
-  assert.ok(r.warnings.some((w) => /same model checks its own work in plan, dev, wiki, qa/.test(w)));
+  assert.ok(r.warnings.some((w) => /same model checks its own work in plan, dev, wiki, qa.*\(richter, ubel, frieren, genau\)/.test(w)));
 
-  assert.equal(t.node("config.mjs", "set", "richter.effort", "high", "--local").status, 0);
-  assert.equal(t.node("config.mjs", "set", "genau.effort", "high", "--local").status, 0);
+  for (const role of ["richter", "ubel", "frieren", "genau"]) assert.equal(t.node("config.mjs", "set", `${role}.effort`, "high", "--local").status, 0);
   assert.equal(t.node("config.mjs", "--json").json.warnings.length, 0);
 });
 
@@ -252,7 +262,7 @@ test("workers get network by role default; reviewers get none", () => {
   t.denken("start", t.run);
   t.drive();
   const net = Object.fromEntries(t.callsFull().map((line) => line.split(" ")).map(([, call, , n]) => [call, n]));
-  assert.deepEqual(net, { "plan-methode-1": "nonet", "plan-richter-1": "-", "dev-stark-1": "net", "dev-richter-1": "-", "qa-genau-1": "net", "wiki-serie-1": "nonet", "wiki-richter-1": "-" });
+  assert.deepEqual(net, { "plan-methode-1": "nonet", "plan-richter-1": "-", "dev-stark-1": "net", "dev-ubel-1": "-", "qa-genau-1": "net", "wiki-serie-1": "nonet", "wiki-frieren-1": "-" });
   assert.equal(t.node("config.mjs", "set", "stark.network", "false").status, 0);
   const u = setup({}, { roles: { stark: { network: false }, methode: { network: true } } });
   u.denken("start", u.run);
@@ -273,7 +283,7 @@ test("a call that exceeds the timeout is retried once, then blocks", () => {
 test("only one engine process works on a run at a time; a dead or silent holder's lock is taken over", () => {
   const t = setup();
   t.denken("start", t.run);
-  const lock = join(t.proj, `${t.run}.lock`);
+  const lock = join(t.proj, ".denken", "locks", `${t.run.split("/").pop()}.lock`);
   const hold = (pid) => {
     rmSync(lock, { recursive: true, force: true });
     mkdirSync(lock);
@@ -331,7 +341,7 @@ test("a stage-wide ruling must name each finding it dismisses", () => {
 });
 
 test("a slightly renamed topic on the same file counts as the same topic", () => {
-  const t = setup({ "dev-richter-1": changes(finding("error handling timeout")), "dev-richter-2": changes(finding("timeout error handling logic")), "dev-richter-3": changes(finding("handling-timeout-errors")) });
+  const t = setup({ "dev-ubel-1": changes(finding("error handling timeout")), "dev-ubel-2": changes(finding("timeout error handling logic")), "dev-ubel-3": changes(finding("handling-timeout-errors")) });
   t.denken("start", t.run);
   const r = t.drive();
   assert.equal(r.reason, "topic_repeated");
@@ -348,4 +358,157 @@ test("start refuses when the same model would check its own work, unless allowed
   assert.equal(t.denken("start", t.run).json.action, "started");
   assert.equal(t.drive().action, "done");
   assert.ok(t.calls().every((c) => c.startsWith("codex")));
+});
+
+test("start refuses a spec without in-scope and out-of-scope sections", () => {
+  const t = setup();
+  writeFileSync(join(t.proj, t.run, "spec.md"), "# Spec\n\n## Goal\nSomething.\n");
+  const r = t.denken("start", t.run);
+  assert.equal(r.status, 1);
+  assert.match(r.json.error, /In scope.*Out of scope/s);
+  writeFileSync(join(t.proj, t.run, "spec.md"), "# Spec\n\n## In scope\n- S1. One. Done when: it works.\n\n## Out of scope\n- None\n");
+  assert.equal(t.denken("start", t.run).json.action, "started");
+});
+
+test("development waits until the user confirms the TODO lists; a change request replans", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  const gate = t.drive({ autoConfirm: false });
+  assert.equal(gate.action, "needs_user");
+  assert.equal(gate.reason, "confirm_todos");
+  assert.deepEqual(gate.files.map((f) => f.split("/").pop()), ["spec.md", "todo-dev.md", "todo-qa.md"]);
+  assert.ok(!t.calls().some((c) => c.includes("dev-stark")));
+  assert.equal(t.denken("retry", t.run).status, 1);
+  assert.equal(t.denken("rule", t.run, "--decision", "uphold", "--note", "x").status, 1);
+
+  assert.equal(t.denken("rule", t.run, "--decision", "replan", "--note", "The user wants D2 split in two.").json.action, "ruled");
+  assert.equal(t.drive({ autoConfirm: false }).reason, "confirm_todos");
+  assert.ok(t.calls().includes("claude plan-methode-2 rw"));
+  assert.match(readFileSync(join(t.proj, t.run, "calls", "plan-methode-2.prompt.md"), "utf8"), /rulings\.md/);
+  assert.equal(t.denken("confirm", t.run).status, 1);
+  assert.equal(t.denken("confirm", t.run, "--user-said", "Yes, build it.").json.action, "confirmed");
+  assert.equal(t.state().confirmed.userSaid, "Yes, build it.");
+  assert.equal(t.drive().action, "done");
+});
+
+test("each role reads only its inputs: STARK the dev TODO, GENAU the spec and QA TODO, reviewers the spec", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  t.drive();
+  const reads = (call) => {
+    const prompt = readFileSync(join(t.proj, t.run, "calls", `${call}.prompt.md`), "utf8");
+    return prompt.match(/- Read:\n((?: {2}- .+\n)+)/)[1].split("\n").filter(Boolean).map((l) => l.split("/").pop());
+  };
+  assert.deepEqual(reads("plan-methode-1"), ["spec.md"]);
+  assert.deepEqual(reads("plan-richter-1"), ["spec.md", "todo-dev.md", "todo-qa.md"]);
+  assert.deepEqual(reads("dev-stark-1"), ["todo-dev.md"]);
+  assert.deepEqual(reads("dev-ubel-1"), ["spec.md", "todo-dev.md", "dev-report.md", "dev-ubel-1.diff"]);
+  assert.deepEqual(reads("qa-genau-1"), ["spec.md", "todo-qa.md"]);
+  assert.ok(reads("wiki-frieren-1").includes("spec.md"));
+  // Each stage has its own reviewer, whose prompt adds the rules every reviewer shares.
+  for (const [call, name] of [["plan-richter-1", "RICHTER"], ["dev-ubel-1", "UBEL"], ["wiki-frieren-1", "FRIEREN"]]) {
+    const prompt = readFileSync(join(t.proj, t.run, "calls", `${call}.prompt.md`), "utf8");
+    assert.ok(prompt.startsWith(`# ${name}:`));
+    assert.match(prompt, /## How every DENKEN reviewer works/);
+  }
+});
+
+test("TODO lists with coverage gaps go straight back to METHODE, each gap with its own identity", () => {
+  const todoDev = "## Acceptance\n- S1. One. Done when: one works!\n\n## TODO\n- [ ] D1 (S1) one\n- [ ] D2 (X1) three\n- D3 (S1) no checkbox\n";
+  const todoQa = "## Checks\n- [ ] Q1 (S1) one\n\n## Notes\n- Q1 already covers S1; this prose line is not an item.\n";
+  const t = setup({ "plan-methode-1": { todoDev, todoQa } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  // No review was spent on the gapped lists.
+  assert.deepEqual(t.calls().slice(0, 3), ["claude plan-methode-1 rw", "claude plan-methode-2 rw", "codex plan-richter-2 ro"]);
+  const gaps = t.state().findings.plan.filter((f) => f.source === "engine");
+  assert.deepEqual([...new Set(gaps.map((g) => g.identity))].sort(), ["spec-2", "todo-D2", "todo-acceptance-S1", "todo-acceptance-S2", "todo-do-not-build-X1", "todo-format-D3"]);
+  assert.ok(gaps.some((g) => g.problem === "S1 in the Acceptance section of todo-dev.md differs from spec.md"));
+  assert.ok(!gaps.some((g) => /Q1/.test(g.problem)));
+  assert.match(readFileSync(join(t.proj, t.run, "calls", "plan-methode-2.prompt.md"), "utf8"), /plan-methode-1\.gaps\.json/);
+});
+
+test("a Q item missing from the QA report counts as a failure", () => {
+  const t = setup({ "qa-genau-1": { qa: { result: "PASS", items: [qaItem(1)] } } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  assert.ok(t.calls().includes("codex dev-stark-2 rw"));
+  const failures = JSON.parse(readFileSync(join(t.proj, t.run, "calls", "qa-genau-1.failures.json"), "utf8"));
+  assert.deepEqual(failures.map((f) => [f.qa_item, f.spec_item, f.evidence]), [["Q2", 2, "missing from the QA report"]]);
+});
+
+test("STARK may not edit the TODO lists or the spec", () => {
+  const t = setup({ "dev-stark-1": { touch: "$RUN/todo-dev.md" } });
+  t.denken("start", t.run);
+  const r = t.drive();
+  assert.equal(r.reason, "guard_violation");
+  assert.match(r.violations.join("\n"), /todo-dev\.md \(restored\)/);
+  assert.doesNotMatch(readFileSync(join(t.proj, t.run, "todo-dev.md"), "utf8"), /tampered/);
+});
+
+test("start refuses open clarification markers and S items without Done when", () => {
+  const t = setup();
+  writeFileSync(join(t.proj, t.run, "spec.md"), "## In scope\n- S1. One. Done when: it works.\n- S2. Two.\n\n## Out of scope\n- None\n\n[NEEDS CLARIFICATION: which encoding?]\n");
+  const r = t.denken("start", t.run);
+  assert.equal(r.status, 1);
+  assert.match(r.json.error, /S2 needs a "Done when:"/);
+  assert.match(r.json.error, /which encoding\?/);
+});
+
+test("open questions in the development TODO must be answered before development starts", () => {
+  const withQuestion = "## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) one\n- [ ] D2 (S2) two\n\n## Open questions\n- Should errors be logged?\n";
+  const t = setup({ "plan-methode-1": { todoDev: withQuestion } });
+  t.denken("start", t.run);
+  const gate = t.drive({ autoConfirm: false });
+  assert.deepEqual(gate.openQuestions, ["Should errors be logged?"]);
+  const refused = t.denken("confirm", t.run, "--user-said", "ok");
+  assert.equal(refused.status, 1);
+  assert.match(refused.json.error, /open questions/);
+  writeFileSync(join(t.proj, t.run, "spec.md"), `${readFileSync(join(t.proj, t.run, "spec.md"), "utf8")}\n## Decisions\n- Should errors be logged? → No.\n`);
+  t.denken("rule", t.run, "--decision", "replan", "--note", "The user answered: errors are not logged.");
+  assert.deepEqual(t.drive({ autoConfirm: false }).openQuestions, []);
+  assert.equal(t.denken("confirm", t.run, "--user-said", "ok").json.action, "confirmed");
+  assert.equal(t.drive().action, "done");
+});
+
+test("a change after confirmation stops the run; spec or dev TODO changes need a replan", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  t.drive({ autoConfirm: false });
+  t.denken("confirm", t.run, "--user-said", "Approved.");
+  const spec = join(t.proj, t.run, "spec.md");
+  const original = readFileSync(spec, "utf8");
+  writeFileSync(spec, original.replace("- X1. Three.", "- X1. Three.\n- X2. Four."));
+  const r = t.drive({ autoConfirm: false });
+  assert.equal(r.reason, "scope_changed");
+  assert.deepEqual(r.changed, ["spec"]);
+  assert.ok(!t.calls().some((c) => c.includes("dev-stark")));
+  assert.match(t.denken("confirm", t.run, "--user-said", "Fine.").json.error, /no reviewer has checked the new content/);
+  // Restoring what the user approved lets the run continue.
+  writeFileSync(spec, original);
+  assert.equal(t.denken("confirm", t.run, "--user-said", "Approved again.").json.action, "confirmed");
+  // A change to the QA TODO alone can be approved directly.
+  const qa = join(t.proj, t.run, "todo-qa.md");
+  writeFileSync(qa, readFileSync(qa, "utf8").replace("check two", "check two, more carefully"));
+  assert.deepEqual(t.drive({ autoConfirm: false }).changed, ["todoQa"]);
+  assert.equal(t.denken("confirm", t.run, "--user-said", "OK, the QA change is fine.").json.action, "confirmed");
+  assert.equal(t.drive().action, "done");
+  assert.equal(t.state().confirmations.length, 3);
+});
+
+test("a QA report with items that are not in todo-qa.md is rejected and retried", () => {
+  const t = setup({ "qa-genau-1": [{ qa: { result: "FAIL", items: [qaItem(1), qaItem(2), qaItem(99, "FAIL")] } }, {}] });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  assert.equal(t.calls().filter((c) => c.includes("qa-genau-1")).length, 2);
+  assert.ok(!t.calls().includes("codex dev-stark-2 rw"));
+});
+
+test("after a QA failure, the dev reviewer checks that the fix is general", () => {
+  const t = setup({ "qa-genau-1": { qa: { result: "FAIL", items: [qaItem(1), qaItem(2, "FAIL")] } } });
+  t.denken("start", t.run);
+  t.drive();
+  const prompt = readFileSync(join(t.proj, t.run, "calls", "dev-ubel-2.prompt.md"), "utf8");
+  assert.match(prompt, /qa-genau-1\.failures\.json/);
+  assert.match(prompt, /special-casing/);
 });

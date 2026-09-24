@@ -1,18 +1,19 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["result", "criteria"],
+  "required": ["result", "items"],
   "properties": {
     "result": { "type": "string", "enum": ["PASS", "FAIL"] },
-    "criteria": {
+    "items": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "criterion", "how_verified", "result", "evidence", "reproduce"],
+        "required": ["id", "spec_item", "check", "how_verified", "result", "evidence", "reproduce"],
         "properties": {
           "id": { "type": "integer" },
-          "criterion": { "type": "string" },
+          "spec_item": { "type": ["integer", "null"] },
+          "check": { "type": "string" },
           "how_verified": { "type": "string" },
           "result": { "type": "string", "enum": ["PASS", "FAIL"] },
           "evidence": { "type": "string" },

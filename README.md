@@ -19,32 +19,36 @@ npx skills add geonwoo-jeong/denken --skill <name> -g -a claude-code
 
 | Skill | Description |
 | ----- | ----------- |
-| [denken](skills/denken/SKILL.md) | Master orchestrator. Takes a task through plan → develop → independent QA → wiki. Each stage's work is reviewed read-only by a different AI, and only approved results are delivered. |
+| [denken](skills/denken/SKILL.md) | Master orchestrator. Agrees a spec with you, has TODO lists written and confirmed, then builds, verifies and documents the work. Each stage is reviewed read-only by a different AI, and only approved results are delivered. |
 
 ### The DENKEN team
 
 ```text
-user ⇄ DENKEN ─▶ plan  METHODE ⇄ RICHTER
-               ─▶ dev   STARK   ⇄ RICHTER   ◀─ QA failure
-               ─▶ qa    GENAU
-               ─▶ wiki  SERIE   ⇄ RICHTER
-               ─▶ done  approved results only
+spec    DENKEN ⇄ you          spec.md: in scope (S1..), out of scope (X1..)
+plan    METHODE ⇄ RICHTER     todo-dev.md (D1..), todo-qa.md (Q1..)
+        you confirm the scope and both TODO lists
+dev     STARK ⇄ UBEL          code + unit tests, built from todo-dev.md only
+qa      GENAU                 runs todo-qa.md; a failure goes back to dev
+wiki    SERIE ⇄ FRIEREN
+done    approved results only
 ```
 
 | Name | Role | Default provider |
 | ---- | ---- | ---------------- |
-| DENKEN | Master / orchestrator: the only agent the user talks to | the agent you run it in |
-| METHODE | Planning worker | Claude |
-| STARK | Development worker | Codex |
+| DENKEN | Orchestrator. The only agent you talk to; asks what it needs and writes the spec | the agent you run it in |
+| METHODE | Planning worker: turns the spec into a development TODO and a QA TODO | Claude |
+| STARK | Development worker: builds the development TODO, unit tests included | Codex |
 | SERIE | Wiki / knowledge worker | Claude |
-| RICHTER | Read-only reviewer for plan, dev and wiki | the other provider from the stage's worker |
-| GENAU | Independent QA | the other provider from STARK |
+| RICHTER | Planning reviewer: checks the TODO lists against the spec, read-only | the other provider from METHODE |
+| UBEL | Development reviewer: checks code, TODO status and change scope against the plan, read-only | the other provider from STARK |
+| FRIEREN | Wiki reviewer: checks the docs against the code and the spec, read-only | the other provider from SERIE |
+| GENAU | Independent QA: runs the QA TODO against the product | the other provider from STARK |
 
 How it works:
 
-- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent only does intake, rules on disputes and talks to you.
+- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent writes the spec with you, rules on disputes and reports back.
 - **Read-only review:** reviewers are read-only. Claude gets only Read, Grep and Glob; Codex runs in its read-only sandbox. A review that changes a file is rejected.
-- **Approval gate:** a stage moves on only after its review has no blocking findings.
+- **Approval gate:** a stage moves on only after its review has no blocking findings. The engine also checks that the TODO lists cover every in-scope item and nothing out of scope, and development waits for you to confirm them.
 - **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
 - **Single provider:** with only Claude or only Codex installed, everything runs on that provider.
 

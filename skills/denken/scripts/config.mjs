@@ -7,12 +7,13 @@
 //   node config.mjs unset <key> [--local|--global]
 //   node config.mjs reset [--local|--global]              delete the config file
 //
-// Keys: <role>              provider: claude | codex | auto   (roles: methode, stark, serie, richter, genau)
+// Keys: <role>              provider: claude | codex | auto
+//                           workers: methode (plan), stark (dev), serie (wiki)
+//                           reviewers: richter (plan), ubel (dev), frieren (wiki); QA: genau
 //       <role>.model        model name passed to the provider CLI
 //       <role>.effort       reasoning effort passed to the provider CLI
 //       <role>.network      true | false: network access for the role's commands
 //                           (default: true for stark and genau, false for the others; reviewers never)
-//       richter.<stage>     per-stage reviewer override (stage: plan, dev, wiki), also .model and .effort
 //       providers           comma-separated list of providers DENKEN may use
 //       allowSameReviewer   true lets the same provider, model and effort check its own work
 //       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin
@@ -30,7 +31,8 @@ import { fileURLToPath } from "node:url";
 export const SUPPORTED = ["claude", "codex"];
 export const DEFAULT_LIMITS = { topicRepeats: 3, roundsPerStage: 5, callTimeoutMin: 60 };
 const WORKER = { plan: "methode", dev: "stark", wiki: "serie" };
-const ROLES = ["methode", "stark", "serie", "richter", "genau"];
+const REVIEWER = { plan: "richter", dev: "ubel", wiki: "frieren" };
+const ROLES = ["methode", "stark", "serie", "richter", "ubel", "frieren", "genau"];
 const FIELDS = ["provider", "model", "effort", "network"];
 
 export function configPaths(root = process.cwd()) {
@@ -56,12 +58,7 @@ function mergeRoles(layers) {
   const roles = {};
   for (const layer of layers) {
     for (const [role, value] of Object.entries(layer?.roles ?? {})) {
-      const spec = asSpec(value);
-      const merged = { ...roles[role], ...spec };
-      if (role === "richter") for (const stage of Object.keys(WORKER)) {
-        if (roles.richter?.[stage] || spec[stage]) merged[stage] = { ...asSpec(roles.richter?.[stage] ?? {}), ...asSpec(spec[stage] ?? {}) };
-      }
-      roles[role] = merged;
+      roles[role] = { ...roles[role], ...asSpec(value) };
     }
   }
   return roles;
@@ -164,15 +161,14 @@ export function resolveConfig(root = process.cwd()) {
       warnings.push(`${label} is set to ${provider}, which is ${why} here; using ${other} instead`);
       provider = other;
     }
-    const network = avoid && label.startsWith("richter") ? false : typeof spec.network === "boolean" ? spec.network : networkDefault;
+    const network = Object.values(REVIEWER).includes(label) ? false : typeof spec.network === "boolean" ? spec.network : networkDefault;
     return { provider, model: spec.model ?? null, effort: spec.effort ?? null, network };
   };
 
   const stages = {};
   for (const [stage, role] of Object.entries(WORKER)) {
     const worker = pick(role, roles[role] ?? {}, defaultProvider[role], null, role === "stark");
-    const { plan, dev, wiki, ...base } = roles.richter ?? {};
-    const reviewer = pick(`richter.${stage}`, { ...base, ...asSpec(roles.richter?.[stage] ?? {}) }, null, worker.provider);
+    const reviewer = pick(REVIEWER[stage], roles[REVIEWER[stage]] ?? {}, null, worker.provider);
     stages[stage] = { worker, reviewer };
   }
   stages.qa = { runner: pick("genau", roles.genau ?? {}, null, stages.dev.worker.provider, true) };
@@ -185,7 +181,7 @@ export function resolveConfig(root = process.cwd()) {
   for (const stage of Object.keys(WORKER)) {
     const { worker, reviewer } = stages[stage];
     if (crossProvider && worker.provider === reviewer.provider) {
-      errors.push(`${stage}: ${WORKER[stage]} and richter are both ${worker.provider}; the reviewer must use a different provider`);
+      errors.push(`${stage}: ${WORKER[stage]} and ${REVIEWER[stage]} are both ${worker.provider}; the reviewer must use a different provider`);
     } else if (same(worker, reviewer)) sameReviewer.push(stage);
   }
   if (crossProvider && stages.qa.runner.provider === stages.dev.worker.provider) {
@@ -195,7 +191,7 @@ export function resolveConfig(root = process.cwd()) {
   const holes = offline ? claudeNetworkHoles(root) : [];
   if (holes.length) warnings.push(`Claude roles with network off can still reach hosts your Claude settings allow: ${holes.join("; ")}`);
   if (sameReviewer.length && !allowSameReviewer) {
-    warnings.push(`the same model checks its own work in ${sameReviewer.join(", ")}; runs will not start until you set a different richter/genau model or effort, or set allowSameReviewer true`);
+    warnings.push(`the same model checks its own work in ${sameReviewer.join(", ")}; runs will not start until you give the reviewer (${sameReviewer.map((st) => (st === "qa" ? "genau" : REVIEWER[st])).join(", ")}) a different model or effort, or set allowSameReviewer true`);
   }
 
   return { errors, warnings, status, usable, crossProvider, sameReviewer, allowSameReviewer, sources, stages, limits };
@@ -225,7 +221,7 @@ function show(json) {
     const row = (a, b, c) => console.log(`  ${a.padEnd(5)} ${b.padEnd(28)} ${c}`);
     row("stage", "worker", "reviewer / runner");
     for (const [stage, role] of Object.entries(WORKER)) {
-      row(stage, `${role.toUpperCase()} → ${describe(r.stages[stage].worker)}`, `RICHTER → ${describe(r.stages[stage].reviewer)}`);
+      row(stage, `${role.toUpperCase()} → ${describe(r.stages[stage].worker)}`, `${REVIEWER[stage].toUpperCase()} → ${describe(r.stages[stage].reviewer)}`);
       if (stage === "dev") row("qa", "", `GENAU → ${describe(r.stages.qa.runner)}`);
     }
   }
@@ -242,7 +238,7 @@ function fail(message) {
 // Returns [object, key] addressing the value for a dotted config key.
 function locate(config, key, create) {
   const parts = key.split(".");
-  const [head, a, b] = parts;
+  const [head, a] = parts;
   if ((head === "providers" || head === "allowSameReviewer") && parts.length === 1) return [config, head];
   if (head === "limits" && parts.length === 2 && a in DEFAULT_LIMITS) {
     if (create) config.limits ??= {};
@@ -254,10 +250,6 @@ function locate(config, key, create) {
   const spec = roles[head] ?? {};
   if (parts.length === 1) return [spec, "provider"];
   if (parts.length === 2 && FIELDS.includes(a)) return [spec, a];
-  if (head === "richter" && a in WORKER && (parts.length === 2 || FIELDS.includes(b))) {
-    if (create || spec[a]) spec[a] = asSpec(spec[a] ?? {});
-    return [spec[a] ?? {}, b ?? "provider"];
-  }
   return null;
 }
 
@@ -268,7 +260,7 @@ function update(path, mutate) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
   const ignore = join(dirname(configPaths().shared), ".gitignore");
-  if (path !== configPaths().global && !existsSync(ignore)) writeFileSync(ignore, "runs/\nconfig.local.json\n");
+  if (path !== configPaths().global && !existsSync(ignore)) writeFileSync(ignore, "runs/\nlocks/\nconfig.local.json\n");
   const { errors } = resolveConfig();
   if (errors.length) {
     if (previous === null) rmSync(path);
@@ -284,7 +276,7 @@ function main() {
   const paths = configPaths();
   const target = args.includes("--global") ? paths.global : args.includes("--local") ? paths.local : paths.shared;
   const [command, key, value] = args.filter((a) => !a.startsWith("--"));
-  const keyHelp = "Keys: <role>[.model|.effort|.network], richter.<plan|dev|wiki>[.model|.effort], providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin";
+  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin`;
 
   if (!command) return show(args.includes("--json"));
   if (command === "init") {
@@ -292,7 +284,8 @@ function main() {
     const r = resolveConfig();
     if (r.errors.length) fail(r.errors.join("\n  "));
     const provider = (agent) => ({ provider: agent.provider });
-    const roles = { methode: provider(r.stages.plan.worker), stark: provider(r.stages.dev.worker), serie: provider(r.stages.wiki.worker), richter: { provider: "auto" }, genau: { provider: "auto" } };
+    const auto = { provider: "auto" };
+    const roles = { methode: provider(r.stages.plan.worker), stark: provider(r.stages.dev.worker), serie: provider(r.stages.wiki.worker), richter: auto, ubel: auto, frieren: auto, genau: auto };
     return update(target, (config) => Object.assign(config, { roles }));
   }
   if (command === "set") {

@@ -5,7 +5,8 @@
 // verdicts, counting repeated topics, and every write to state.json.
 //
 //   node denken.mjs new <slug>                  create .denken/runs/<id>/ and print its path
-//   node denken.mjs start <run>                 check brief.md, snapshot the role assignment, begin plan
+//   node denken.mjs start <run>                 check spec.md, snapshot the role assignment, begin plan
+//   node denken.mjs confirm <run> --user-said <text>   the user approved the scope and TODO lists; begin dev
 //   node denken.mjs next <run> [--wait <sec>]   advance the run; prints one JSON action
 //   node denken.mjs rule <run> --decision <uphold|dismiss|replan|abort> (--note <text> | --note-file <path>)
 //                   [--identities <a,b>]        which open findings a dismissal covers
@@ -14,11 +15,12 @@
 //   node denken.mjs status <run>                compact summary
 //
 // Actions printed by next: running | needs_ruling | needs_user | done | aborted.
+// Run files: spec.md (DENKEN) -> todo-dev.md + todo-qa.md (METHODE) -> user confirms -> dev, qa, wiki.
 // Run from the project root.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig } from "./config.mjs";
 
@@ -30,7 +32,11 @@ const NOT_DENKEN = ":(exclude).denken";
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const NEXT_STAGE = { plan: "dev", dev: "qa", qa: "wiki", wiki: "done" };
 const WORKER = { plan: "methode", dev: "stark", wiki: "serie" };
-const ARTIFACT = { plan: "plan.md", dev: "dev-report.md", wiki: "wiki-report.md" };
+const REVIEWER = { plan: "richter", dev: "ubel", wiki: "frieren" };
+const SPEC = "spec.md";
+const TODO_DEV = "todo-dev.md";
+const TODO_QA = "todo-qa.md";
+const ARTIFACTS = { plan: [TODO_DEV, TODO_QA], dev: ["dev-report.md"], wiki: ["wiki-report.md"] };
 const USAGE_LIMIT = /usage limit|rate[ _-]?limit|quota|too many requests|\b429\b/i;
 
 // ---------- helpers
@@ -152,34 +158,178 @@ function pinOwned(owned) {
   return pinned;
 }
 
+// ---------- spec and TODO lists
+// spec.md (DENKEN) lists in-scope items "- S<n>. ... Done when: ..." and out-of-scope items
+// "- X<n>. ...". METHODE's todo-dev.md lists "- [ ] D<n> (S..) ..." items plus an Acceptance
+// section (each S item's "Done when") and a Do not build section (the X items), so STARK can
+// work from that one file. todo-qa.md lists "- [ ] Q<n> (S..|X..) ..." items. The engine checks
+// the lists against the spec before a reviewer sees them, and the QA report against todo-qa.md.
+
+const readRunFile = (runDir, name) => (existsSync(join(runDir, name)) ? readFileSync(join(runDir, name), "utf8") : "");
+
+function section(text, heading) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => new RegExp(`^##\\s+${heading}\\s*$`, "i").test(l.trim()));
+  if (start < 0) return null;
+  const end = lines.findIndex((l, i) => i > start && /^##\s/.test(l));
+  return lines.slice(start + 1, end < 0 ? undefined : end).join("\n");
+}
+
+// Items "- S1. ..." in a section, each with the text of its line and any continuation lines.
+function sectionItems(body, letter) {
+  const items = [];
+  for (const line of (body ?? "").split("\n")) {
+    const m = line.match(new RegExp(`^\\s*[-*]\\s*[*_\`]*${letter}(\\d+)\\b`));
+    if (m) items.push({ id: Number(m[1]), text: line });
+    else if (items.length && line.trim() && !/^\s*[-*]\s/.test(line.slice(0, 2))) items.at(-1).text += `\n${line}`;
+  }
+  return items;
+}
+
+function parseSpec(text) {
+  const inScope = section(text, "In scope");
+  const outOfScope = section(text, "Out of scope");
+  const sItems = sectionItems(inScope, "S");
+  const xItems = sectionItems(outOfScope, "X");
+  return { hasIn: inScope !== null, hasOut: outOfScope !== null, sItems, xItems, inScope: sItems.map((i) => i.id), outOfScope: xItems.map((i) => i.id) };
+}
+
+// TODO items live in one section (todo-dev.md "## TODO", todo-qa.md "## Checks") as checkbox
+// lines. Tolerates the formatting models add: "- [ ] **D1** (S1) ...", "- [x] `D1`: (S1) ...".
+// A D/Q-looking line there without a checkbox, a duplicate id, or a missing section is reported,
+// never silently skipped: STARK reads the whole file, so an unparsed item would escape the checks.
+const ITEM_SECTION = { D: "TODO", Q: "Checks" };
+
+function parseTodos(text, letter) {
+  const body = section(text, ITEM_SECTION[letter]);
+  const items = [];
+  const problems = [];
+  if (body === null) problems.push({ key: "section", problem: `the "## ${ITEM_SECTION[letter]}" section is missing` });
+  for (const line of (body ?? "").split("\n")) {
+    const m = line.match(new RegExp(`^\\s*[-*]\\s*\\[([ xX])\\]\\s*[*_\`]*${letter}(\\d+)\\b[*_\`]*\\s*[:.]?\\s*(?:\\(([^)]*)\\))?(.*)$`));
+    if (!m) {
+      const loose = line.match(new RegExp(`^\\s*[-*]\\s*[*_\`]*${letter}(\\d+)\\b`));
+      if (loose) problems.push({ key: `${letter}${loose[1]}`, problem: `${letter}${loose[1]} is not a checkbox line ("- [ ] ${letter}${loose[1]} ...")` });
+      continue;
+    }
+    const id = Number(m[2]);
+    if (items.some((i) => i.id === id)) {
+      problems.push({ key: `${letter}${id}`, problem: `${letter}${id} appears more than once` });
+      continue;
+    }
+    items.push({ id, done: m[1] !== " ", refs: (m[3] ?? "").match(/[SX]\d+/g) ?? [], text: m[4].trim() });
+  }
+  return { items, problems };
+}
+
+// Bullet lines under "## Open questions" in todo-dev.md, other than "None".
+function openQuestions(runDir) {
+  return (section(readRunFile(runDir, TODO_DEV), "Open questions") ?? "")
+    .split("\n")
+    .filter((l) => /^\s*[-*]\s+\S/.test(l) && !/^\s*[-*]\s+(none|n\/a)\b/i.test(l))
+    .map((l) => l.replace(/^\s*[-*]\s+/, "").trim());
+}
+
+function specProblems(text) {
+  const spec = parseSpec(text);
+  const problems = [];
+  if (!spec.hasIn || spec.inScope.length === 0) problems.push('spec.md needs an "## In scope" section with items "- S1. ... Done when: ..."');
+  for (const item of spec.sItems) if (!/done when/i.test(item.text)) problems.push(`S${item.id} needs a "Done when:" condition someone could check`);
+  if (!spec.hasOut) problems.push('spec.md needs an "## Out of scope" section (items "- X1. ...", or "- None")');
+  const unclear = [...text.matchAll(/\[NEEDS CLARIFICATION:([^\]]*)\]/gi)].map((m) => m[1].trim());
+  if (unclear.length) problems.push(`spec.md still has open questions for the user: ${unclear.join("; ")}`);
+  return problems;
+}
+
+// The TODO lists as confirmed: checkbox state is ignored, so STARK ticking items off is not a change.
+function confirmedHashes(runDir) {
+  const untick = (text) => text.replace(/^(\s*[-*]\s*)\[[xX]\]/gm, "$1[ ]");
+  return { spec: sha(readRunFile(runDir, SPEC)), todoDev: sha(untick(readRunFile(runDir, TODO_DEV))), todoQa: sha(untick(readRunFile(runDir, TODO_QA))) };
+}
+
+// Coverage gaps, each with its own identity so one gap cannot hide or dismiss another.
+function todoGaps(runDir) {
+  const spec = parseSpec(readRunFile(runDir, SPEC));
+  const devText = readRunFile(runDir, TODO_DEV);
+  const devParse = parseTodos(devText, "D");
+  const qaParse = parseTodos(readRunFile(runDir, TODO_QA), "Q");
+  const dev = devParse.items;
+  const qa = qaParse.items;
+  const gaps = [];
+  const gap = (identity, file, spec_item, todo, problem, required_change) =>
+    gaps.push({ identity, severity: "blocking", topic: identity, file, line_start: null, line_end: null, spec_item, todo, problem, required_change, source: "engine" });
+  const known = (ref) => (ref[0] === "S" ? spec.inScope : spec.outOfScope).includes(Number(ref.slice(1)));
+
+  if (!dev.length) gap("todo-dev-empty", TODO_DEV, null, null, "todo-dev.md has no D items", 'Write the development TODO under "## TODO" as "- [ ] D1 (S1) ..." items.');
+  if (!qa.length) gap("todo-qa-empty", TODO_QA, null, null, "todo-qa.md has no Q items", 'Write the QA TODO under "## Checks" as "- [ ] Q1 (S1) ..." items.');
+  for (const [file, parsed] of [[TODO_DEV, devParse], [TODO_QA, qaParse]]) {
+    for (const p of parsed.problems) gap(`todo-format-${p.key}`, file, null, p.key === "section" ? null : p.key, `${file}: ${p.problem}`, "Fix the list format: one checkbox line per item, each id once, inside its section.");
+  }
+  // STARK's contract is the copied text itself, so the copies must match the spec. Only
+  // whitespace, the bullet, emphasis and case may differ.
+  const contract = (text) => text.replace(/^\s*[-*]\s*/, "").replace(/[*_`]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  const copies = (heading, letter) => new Map(sectionItems(section(devText, heading), letter).map((i) => [i.id, contract(i.text)]));
+  const acceptance = copies("Acceptance", "S");
+  const doNotBuild = copies("Do not build", "X");
+  for (const item of spec.sItems) {
+    const n = item.id;
+    if (dev.length && !dev.some((d) => d.refs.includes(`S${n}`))) gap(`spec-${n}`, TODO_DEV, n, null, `S${n} has no development TODO`, `Add a D item that implements S${n}.`);
+    if (qa.length && !qa.some((q) => q.refs.includes(`S${n}`))) gap(`spec-${n}`, TODO_QA, n, null, `S${n} has no QA TODO`, `Add a Q item that verifies S${n}.`);
+    if (!acceptance.has(n)) gap(`todo-acceptance-S${n}`, TODO_DEV, n, null, `S${n} is missing from the Acceptance section of todo-dev.md`, `Copy S${n} and its "Done when" from spec.md into "## Acceptance".`);
+    else if (acceptance.get(n) !== contract(item.text)) gap(`todo-acceptance-S${n}`, TODO_DEV, n, null, `S${n} in the Acceptance section of todo-dev.md differs from spec.md`, `Copy S${n} from spec.md word for word.`);
+  }
+  for (const item of spec.xItems) {
+    const n = item.id;
+    if (!doNotBuild.has(n)) gap(`todo-do-not-build-X${n}`, TODO_DEV, null, null, `X${n} is missing from the Do not build section of todo-dev.md`, `Copy X${n} from spec.md into "## Do not build".`);
+    else if (doNotBuild.get(n) !== contract(item.text)) gap(`todo-do-not-build-X${n}`, TODO_DEV, null, null, `X${n} in the Do not build section of todo-dev.md differs from spec.md`, `Copy X${n} from spec.md word for word.`);
+  }
+  for (const d of dev) {
+    if (!d.refs.some((r) => r[0] === "S")) gap(`todo-D${d.id}`, TODO_DEV, null, `D${d.id}`, `D${d.id} does not name the spec item it implements`, `Add the S item(s) in parentheses after D${d.id}.`);
+    for (const r of d.refs) {
+      if (r[0] === "X") gap(`todo-D${d.id}`, TODO_DEV, null, `D${d.id}`, `D${d.id} implements ${r}, which the spec puts out of scope`, `Remove D${d.id} or the work for ${r}.`);
+      else if (!known(r)) gap(`todo-D${d.id}`, TODO_DEV, null, `D${d.id}`, `D${d.id} refers to ${r}, which the spec does not define`, "Refer only to S items in spec.md.");
+    }
+  }
+  for (const q of qa) {
+    if (!q.refs.length) gap(`todo-Q${q.id}`, TODO_QA, null, `Q${q.id}`, `Q${q.id} does not name the spec item it verifies`, `Add the S or X item in parentheses after Q${q.id}.`);
+    for (const r of q.refs) if (!known(r)) gap(`todo-Q${q.id}`, TODO_QA, null, `Q${q.id}`, `Q${q.id} refers to ${r}, which the spec does not define`, "Refer only to S and X items in spec.md.");
+  }
+  return gaps;
+}
+
 // ---------- prompts
 
 function knownTopics(state, stage) {
   const seen = new Map();
-  for (const f of state.findings[stage] ?? []) seen.set(f.identity, { identity: f.identity, topic: f.topic, file: f.file, criterion: f.criterion, raised: state.counts[stage]?.[f.identity] ?? 0 });
+  for (const f of state.findings[stage] ?? []) seen.set(f.identity, { identity: f.identity, topic: f.topic, file: f.file, spec_item: f.spec_item, raised: state.counts[stage]?.[f.identity] ?? 0 });
   return [...seen.values()];
 }
 
 function buildCall(runDir, state, call) {
   const p = (f) => join(runDir, f);
-  const read = [p("brief.md")];
+  const read = [];
   const write = [];
   const frozen = call.mode !== "work" || call.stage === "plan";
   const guard = { frozen, ignored: call.mode === "qa" ? "env" : frozen ? "all" : "none", allow: [] };
   const extra = [];
   const lastReview = state.lastReview[call.stage];
 
+  // Who reads what is deliberate: STARK builds from the development TODO alone, GENAU tests
+  // from the spec and the QA TODO, and every reviewer judges against the spec.
   if (call.mode === "work") {
-    if (call.stage !== "plan") read.push(p("plan.md"));
-    if (call.stage === "wiki") read.push(p("dev-report.md"), state.lastQa);
-    if (call.stage === "dev" && state.devInput === "qa") read.push(state.lastQa);
+    if (call.stage === "plan") read.push(p(SPEC));
+    if (call.stage === "dev") read.push(p(TODO_DEV));
+    if (call.stage === "wiki") read.push(p(SPEC), p(TODO_DEV), p("dev-report.md"), state.lastQa);
+    if (call.stage === "dev" && state.devInput === "qa") read.push(state.lastQaFailures);
     else if (call.round > 1 && lastReview) read.push(lastReview);
-    write.push(p(ARTIFACT[call.stage]));
-    guard.allow.push(ARTIFACT[call.stage]);
-    if (call.stage === "plan") extra.push("Do not change any project file. Write only plan.md.");
+    write.push(...ARTIFACTS[call.stage].map(p));
+    guard.allow.push(...ARTIFACTS[call.stage]);
+    if (call.stage === "plan") extra.push(`Do not change any project file. Write only ${TODO_DEV} and ${TODO_QA}.`);
+    if (call.stage === "dev") extra.push(`Do not edit ${TODO_DEV}; report each D item's status in dev-report.md.`);
   } else if (call.mode === "review") {
-    if (call.stage !== "plan") read.push(p("plan.md"));
-    read.push(p(ARTIFACT[call.stage]));
+    read.push(p(SPEC));
+    if (call.stage === "dev") read.push(p(TODO_DEV));
+    read.push(...ARTIFACTS[call.stage].map(p));
     if (call.stage !== "plan") {
       const diffPath = `${callBase(runDir, call.id)}.diff`;
       const base = state.stageBase[call.stage] || EMPTY_TREE;
@@ -187,19 +337,25 @@ function buildCall(runDir, state, call) {
       read.push(diffPath);
     }
     if (lastReview) read.push(lastReview);
+    if (call.stage === "dev" && state.devInput === "qa") {
+      read.push(state.lastQaFailures);
+      extra.push("This round fixes failed QA checks (listed in the failures file). Check that each fix is general: no special-casing of the reported inputs, no hard-coded expected outputs, no weakened or deleted tests.");
+    }
     const topics = knownTopics(state, call.stage);
-    if (topics.length) extra.push(`Known topics in this stage. For the same issue, reuse the same topic, file and criterion:\n${topics.map((t) => `  - ${t.identity} (topic "${t.topic}", file ${t.file ?? "none"}, criterion ${t.criterion ?? "none"}, raised ${t.raised}x)`).join("\n")}`);
+    if (topics.length) extra.push(`Known topics in this stage. For the same issue, reuse the same topic, file and spec_item:\n${topics.map((t) => `  - ${t.identity} (topic "${t.topic}", file ${t.file ?? "none"}, spec_item ${t.spec_item ?? "none"}, raised ${t.raised}x)`).join("\n")}`);
     const dismissed = state.dismissed[call.stage] ?? [];
     if (dismissed.length) extra.push(`Dismissed by DENKEN. Do not raise these again: ${dismissed.join(", ")}`);
     const denials = state.lastWork[call.stage]?.denials ?? [];
     if (denials.length) extra.push(`The worker had ${denials.length} action(s) blocked by permissions in its last call. Check that nothing the work depends on was skipped:\n${denials.map((d) => `  - ${d.tool}: ${JSON.stringify(d.input).slice(0, 200)}`).join("\n")}`);
   } else {
-    read.push(p("plan.md"));
+    read.push(p(SPEC), p(TODO_QA));
   }
   if (existsSync(p("rulings.md"))) read.push(p("rulings.md"));
 
   const agent = agentFor(state, call);
-  const roleText = readFileSync(join(SKILL_DIR, "roles", `${call.role}.md`), "utf8");
+  // A reviewer's prompt is its stage checklist followed by the rules every reviewer shares.
+  const roleFile = (name) => readFileSync(join(SKILL_DIR, "roles", `${name}.md`), "utf8").trimEnd();
+  const roleText = call.mode === "review" ? `${roleFile(call.role)}\n\n${roleFile("reviewer")}` : roleFile(call.role);
   const lines = [
     roleText.trimEnd(),
     "",
@@ -234,7 +390,7 @@ function nextCall(state) {
   const stage = state.stage;
   if (stage === "qa") return { stage, role: "genau", mode: "qa", round: ++state.round.qa, attempt: 1 };
   if (state.pending === "work") return { stage, role: WORKER[stage], mode: "work", round: ++state.round[stage], attempt: 1 };
-  return { stage, role: "richter", mode: "review", round: state.round[stage], attempt: 1 };
+  return { stage, role: REVIEWER[stage], mode: "review", round: state.round[stage], attempt: 1 };
 }
 
 function launch(runDir, state) {
@@ -264,7 +420,7 @@ function validOutput(mode, value) {
     return ["APPROVED", "CHANGES_REQUESTED"].includes(value?.verdict) && Array.isArray(value.findings) &&
       value.findings.every((f) => ["blocking", "nonblocking"].includes(f.severity) && typeof f.topic === "string" && typeof f.problem === "string");
   }
-  return ["PASS", "FAIL"].includes(value?.result) && Array.isArray(value.criteria) && value.criteria.length > 0 && value.criteria.every((c) => Number.isInteger(c.id) && ["PASS", "FAIL"].includes(c.result));
+  return ["PASS", "FAIL"].includes(value?.result) && Array.isArray(value.items) && value.items.length > 0 && value.items.every((c) => Number.isInteger(c.id) && ["PASS", "FAIL"].includes(c.result));
 }
 
 // ---------- process groups
@@ -410,9 +566,14 @@ async function execCall(runDir, id) {
     try {
       value = JSON.parse(output);
     } catch {}
+    const qIds = new Set(parseTodos(readRunFile(runDir, TODO_QA), "Q").items.map((q) => q.id));
+    const unknown = job.mode === "qa" && validOutput("qa", value) ? value.items.filter((c) => !qIds.has(c.id)).map((c) => `Q${c.id}`) : [];
     if (!validOutput(job.mode, value)) {
       meta.status = "invalid_output";
       meta.error = "the final message does not match the schema";
+    } else if (unknown.length) {
+      meta.status = "invalid_output";
+      meta.error = `the QA report has items that are not in todo-qa.md: ${unknown.join(", ")}`;
     }
   }
   meta.finished = now();
@@ -441,20 +602,23 @@ function approve(state, stage, evidence) {
   state.approved[stage] = evidence;
   if (stage === "dev") state.devInput = null;
   enterStage(state, NEXT_STAGE[stage]);
+  // Development starts only after the user has confirmed the scope and both TODO lists.
+  if (stage === "plan") block(state, "user", { reason: "confirm_todos", resolveWith: "confirm", stage: "plan" });
 }
 
 const fileOf = (f) => (f.file ? String(f.file).replace(/:\d+.*$/, "") : null);
 const tokens = (text) => new Set(slug(text).split("-").filter(Boolean));
 
-// A finding's identity decides what counts as "the same topic". A criterion wins; otherwise
+// A finding's identity decides what counts as "the same topic". A spec item wins; otherwise
 // file plus topic, where a slightly renamed topic on the same file (token Jaccard >= 0.5)
 // is merged into the known identity.
 function identityOf(f, known) {
-  if (Number.isInteger(f.criterion)) return `criterion-${f.criterion}`;
+  if (f.identity) return f.identity;
+  if (Number.isInteger(f.spec_item)) return `spec-${f.spec_item}`;
   const file = fileOf(f);
   const mine = tokens(f.topic);
   for (const k of known) {
-    if (Number.isInteger(k.criterion) || fileOf(k) !== file) continue;
+    if (Number.isInteger(k.spec_item) || fileOf(k) !== file) continue;
     const theirs = tokens(k.topic);
     const shared = [...mine].filter((t) => theirs.has(t)).length;
     if (shared / (mine.size + theirs.size - shared) >= 0.5) return k.identity;
@@ -509,14 +673,27 @@ function ingest(runDir, state, meta) {
 
   const stage = call.stage;
   if (call.mode === "work") {
-    if (!existsSync(join(runDir, ARTIFACT[stage]))) {
+    const missing = ARTIFACTS[stage].filter((f) => !existsSync(join(runDir, f)));
+    if (missing.length) {
       meta.status = "failed";
-      meta.error = `${ARTIFACT[stage]} was not written`;
+      meta.error = `${missing.join(", ")} was not written`;
       state.inflight = call;
       return ingest(runDir, state, meta);
     }
     state.lastWork[stage] = { call: call.id, denials: meta.denials };
     state.pending = "review";
+    // Deterministic checks run before the reviewer: TODO lists with coverage gaps go straight
+    // back to METHODE as an engine round, without spending a review on them.
+    if (stage === "plan") {
+      const gaps = todoGaps(runDir);
+      if (gaps.length) {
+        const gapsPath = `${base}.gaps.json`;
+        writeFileSync(gapsPath, JSON.stringify({ verdict: "CHANGES_REQUESTED", findings: gaps, checked: ["engine coverage check of the TODO lists against spec.md"] }, null, 2));
+        state.lastReview.plan = gapsPath;
+        recordReview(state, "plan", call, gaps);
+        return;
+      }
+    }
     state.denialStreak[stage] = meta.denials.length ? (state.denialStreak[stage] ?? 0) + 1 : 0;
     if (state.denialStreak[stage] >= 2) {
       block(state, "user", { reason: "repeated_permission_denials", resolveWith: "retry", call: call.id, denials: meta.denials });
@@ -529,18 +706,28 @@ function ingest(runDir, state, meta) {
 
   if (call.mode === "qa") {
     state.lastQa = outPath;
+    // Every Q item must be reported; one that is missing counts as failed.
+    const reported = new Map(output.items.map((c) => [c.id, c]));
+    const items = [...output.items];
+    for (const q of parseTodos(readRunFile(runDir, TODO_QA), "Q").items) {
+      if (!reported.has(q.id)) items.push({ id: q.id, spec_item: Number(q.refs.find((r) => r[0] === "S")?.slice(1)) || null, check: q.text, result: "FAIL", evidence: "missing from the QA report", reproduce: null });
+    }
+    const identity = (c) => (Number.isInteger(c.spec_item) ? `spec-${c.spec_item}` : `qa-${c.id}`);
     const dismissed = new Set(state.dismissed.dev ?? []);
-    const failing = output.criteria.filter((c) => c.result === "FAIL" && !dismissed.has(`criterion-${c.id}`));
+    const failing = items.filter((c) => c.result === "FAIL" && !dismissed.has(identity(c)));
     if (failing.length === 0) return approve(state, "qa", outPath);
-    // Back to dev. Keep the dev stage's diff base so the next review sees every change since dev began.
+    // Back to dev with only the failures: STARK sees what broke, not the QA TODO list.
+    // The dev stage's diff base is kept so the next review sees every change since dev began.
+    state.lastQaFailures = `${base}.failures.json`;
+    writeFileSync(state.lastQaFailures, JSON.stringify(failing.map(({ id, spec_item, check, evidence, reproduce }) => ({ qa_item: `Q${id}`, spec_item, check, evidence, reproduce })), null, 2));
     state.approved.dev = null;
     state.devInput = "qa";
     state.stage = "dev";
     state.pending = "work";
     for (const c of failing) {
-      const identity = `criterion-${c.id}`;
-      state.counts.dev[identity] = (state.counts.dev[identity] ?? 0) + 1;
-      state.findings.dev.push({ round: state.round.dev, call: call.id, identity, topic: identity, file: null, criterion: c.id, problem: `QA failed: ${c.criterion}`, required_change: c.reproduce ?? c.evidence });
+      const id = identity(c);
+      state.counts.dev[id] = (state.counts.dev[id] ?? 0) + 1;
+      state.findings.dev.push({ round: state.round.dev, call: call.id, identity: id, topic: id, file: null, spec_item: c.spec_item ?? null, problem: `QA failed Q${c.id}: ${c.check ?? ""}`, required_change: c.reproduce ?? c.evidence });
     }
     return checkThresholds(state, "dev");
   }
@@ -548,17 +735,23 @@ function ingest(runDir, state, meta) {
   // review
   state.lastReview[stage] = outPath;
   if (stage === "dev") state.devInput = "review";
+  if (recordReview(state, stage, call, output.findings) === 0) approve(state, stage, outPath);
+}
+
+// Records a round's findings (a reviewer's, or the engine's coverage gaps) and returns the
+// number of blocking ones. With any left, the stage goes back to its worker.
+function recordReview(state, stage, call, raw) {
   const dismissed = new Set(state.dismissed[stage] ?? []);
-  const findings = output.findings.map((f) => ({ ...f, identity: identityOf(f, state.findings[stage]) })).filter((f) => !dismissed.has(f.identity));
+  const findings = raw.map((f) => ({ ...f, identity: identityOf(f, state.findings[stage]) })).filter((f) => !dismissed.has(f.identity));
   const blocking = findings.filter((f) => f.severity === "blocking");
   for (const f of findings.filter((f) => f.severity === "nonblocking")) state.deferred.push({ stage, round: call.round, call: call.id, ...f });
   state.history[stage].push({ round: call.round, blocking: blocking.length });
-  if (blocking.length === 0) return approve(state, stage, outPath);
-
+  if (blocking.length === 0) return 0;
   state.pending = "work";
-  for (const f of blocking) state.findings[stage].push({ round: call.round, call: call.id, identity: f.identity, topic: f.topic, file: f.file, criterion: f.criterion, problem: f.problem, required_change: f.required_change });
+  for (const f of blocking) state.findings[stage].push({ round: call.round, call: call.id, identity: f.identity, topic: f.topic, file: f.file, spec_item: f.spec_item ?? null, todo: f.todo ?? null, source: f.source ?? "review", problem: f.problem, required_change: f.required_change });
   for (const identity of new Set(blocking.map((f) => f.identity))) state.counts[stage][identity] = (state.counts[stage][identity] ?? 0) + 1;
   checkThresholds(state, stage);
+  return blocking.length;
 }
 
 // ---------- actions shown to DENKEN
@@ -571,7 +764,14 @@ function actionFor(runDir, state) {
   if (state.blocked) {
     const b = state.blocked;
     if (b.kind === "ruling") {
-      return { action: "needs_ruling", ...b, artifact: ARTIFACT[b.stage] ? join(runDir, ARTIFACT[b.stage]) : null, lastReview: state.lastReview[b.stage], next: "Decide, then run: rule <run> --decision <uphold|dismiss|replan|abort> --note <text>" };
+      return { action: "needs_ruling", ...b, artifacts: (ARTIFACTS[b.stage] ?? []).map((f) => join(runDir, f)), lastReview: state.lastReview[b.stage], next: "Decide, then run: rule <run> --decision <uphold|dismiss|replan|abort> --note <text>" };
+    }
+    if (b.reason === "confirm_todos" || b.reason === "scope_changed") {
+      const questions = openQuestions(runDir);
+      const next = questions.length
+        ? "METHODE left open questions. Ask the user, record the answers under Decisions in spec.md, then run rule --decision replan --note '<the answers>'."
+        : "Show the user the scope (spec.md) and both TODO lists. If they approve, run confirm --user-said '<their approval, verbatim>'. If they want changes, edit spec.md first when the scope itself changes, then run rule --decision replan --note '<their changes>'.";
+      return { action: "needs_user", ...b, files: [SPEC, TODO_DEV, TODO_QA].map((f) => join(runDir, f)), openQuestions: questions, next };
     }
     return { action: "needs_user", ...b, next: b.resolveWith === "rule" ? "Ask the user, then record their decision with rule." : "Tell the user. When it is resolved, run retry (or rule --decision abort)." };
   }
@@ -584,7 +784,7 @@ async function next(runDir, waitSec) {
   const deadline = Date.now() + waitSec * 1000;
   for (;;) {
     const state = load(runDir);
-    if (state.stage === "intake") fail("the run has not started; write brief.md, confirm it with the user, then run start");
+    if (state.stage === "intake") fail("the run has not started; write spec.md, confirm it with the user, then run start");
     if (["done", "aborted"].includes(state.stage) || state.blocked) return print(actionFor(runDir, state));
     if (state.inflight) {
       // Wait on the call's own files only. state.json is not re-read until the call has
@@ -623,6 +823,18 @@ async function next(runDir, waitSec) {
       save(runDir, state);
       continue;
     }
+    // The user confirmed specific content. If spec.md or a TODO list changed since, stop:
+    // development must not run against something the user did not approve.
+    if (state.confirmed && ["dev", "qa", "wiki"].includes(state.stage)) {
+      const current = confirmedHashes(runDir);
+      const changed = Object.keys(current).filter((k) => current[k] !== state.confirmed.hashes[k]);
+      if (changed.length) {
+        block(state, "user", { reason: "scope_changed", resolveWith: "confirm", stage: "plan", changed });
+        assertLock();
+        save(runDir, state);
+        continue;
+      }
+    }
     assertLock();
     launch(runDir, state);
     if (Date.now() >= deadline) return print(actionFor(runDir, load(runDir)));
@@ -640,16 +852,16 @@ function cmdNew(name) {
   if (existsSync(dir)) fail(`run already exists: ${relative(ROOT, dir)}`);
   mkdirSync(join(dir, "calls"), { recursive: true });
   const ignore = join(DENKEN_DIR, ".gitignore");
-  if (!existsSync(ignore)) writeFileSync(ignore, "runs/\nconfig.local.json\n");
+  if (!existsSync(ignore)) writeFileSync(ignore, "runs/\nlocks/\nconfig.local.json\n");
   save(dir, { version: 1, task: name, created: now(), stage: "intake" });
-  print({ action: "created", run: relative(ROOT, dir), next: `Write ${relative(ROOT, join(dir, "brief.md"))}, confirm it with the user, then run start.` });
+  print({ action: "created", run: relative(ROOT, dir), next: `Write ${relative(ROOT, join(dir, SPEC))}, confirm it with the user, then run start.` });
 }
 
 function cmdStart(runDir) {
   const state = load(runDir);
   if (state.stage !== "intake") fail(`run already started (stage: ${state.stage})`);
-  const brief = join(runDir, "brief.md");
-  if (!existsSync(brief) || !readFileSync(brief, "utf8").trim()) fail("brief.md is missing or empty");
+  const problems = specProblems(readRunFile(runDir, SPEC));
+  if (problems.length) fail(problems.join("; "));
   if (spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: ROOT }).status !== 0) fail("DENKEN needs a git work tree to detect file changes; run git init first");
   const config = resolveConfig(ROOT);
   if (config.errors.length) {
@@ -657,7 +869,7 @@ function cmdStart(runDir) {
     process.exit(1);
   }
   if (config.sameReviewer.length && !config.allowSameReviewer) {
-    print({ action: "needs_user", reason: "same_reviewer", stages: config.sameReviewer, next: "The same model would check its own work. Ask the user: set a different richter/genau model or effort with config.mjs, or set allowSameReviewer true. Then run start again." });
+    print({ action: "needs_user", reason: "same_reviewer", stages: config.sameReviewer, next: "The same model would check its own work. Ask the user: set a different reviewer (richter, ubel, frieren) or genau model or effort with config.mjs, or set allowSameReviewer true. Then run start again." });
     process.exit(1);
   }
   Object.assign(state, {
@@ -676,6 +888,7 @@ function cmdStart(runDir) {
     lastReview: {},
     lastWork: {},
     lastQa: null,
+    lastQaFailures: null,
     devInput: null,
     deferred: [],
     rulings: [],
@@ -703,6 +916,13 @@ function cmdRule(runDir, args) {
 
   const b = state.blocked;
   const stage = b.stage ?? state.stage;
+  if (["confirm_todos", "scope_changed"].includes(b.reason) && !["replan", "abort"].includes(decision)) {
+    fail("at the TODO confirmation, use confirm when the user approves, or rule --decision replan|abort");
+  }
+  if (decision === "replan") {
+    const problems = specProblems(readRunFile(runDir, SPEC));
+    if (problems.length) fail(`fix spec.md before replanning: ${problems.join("; ")}`);
+  }
   // Dismissals are per finding: a stage-wide ruling must name each identity it dismisses.
   const open = new Set(state.findings[stage]?.filter((f) => f.round === state.round[stage]).map((f) => f.identity));
   const listIndex = args.indexOf("--identities");
@@ -730,6 +950,7 @@ function cmdRule(runDir, args) {
   else if (decision === "replan") {
     for (const s of ["plan", "dev", "qa", "wiki"]) state.approved[s] = null;
     state.devInput = null;
+    state.confirmed = null;
     enterStage(state, "plan");
   } else if (decision === "dismiss") {
     (state.dismissed[stage] ??= []).push(...targets);
@@ -752,7 +973,7 @@ function cmdRetry(runDir) {
   const state = load(runDir);
   const b = state.blocked;
   if (!b || b.kind !== "user") fail("nothing to retry: the run is not waiting on the user");
-  if (b.resolveWith === "rule") fail("this block needs a decision: use rule");
+  if (b.resolveWith !== "retry") fail(`this block is resolved with ${b.resolveWith}, not retry`);
   state.blocked = null;
   if (b.reason !== "repeated_permission_denials") {
     const last = state.calls.findLast((c) => c.id === b.call);
@@ -815,7 +1036,8 @@ function assertLock() {
 }
 
 async function acquireLock(runDir, waitMs) {
-  const dir = `${runDir}.lock`;
+  mkdirSync(join(DENKEN_DIR, "locks"), { recursive: true });
+  const dir = join(DENKEN_DIR, "locks", `${basename(runDir)}.lock`);
   const deadline = Date.now() + waitMs;
   const nonce = randomUUID();
   for (;;) {
@@ -866,6 +1088,29 @@ async function acquireLock(runDir, waitMs) {
   }
 }
 
+function cmdConfirm(runDir, args) {
+  const state = load(runDir);
+  if (!["confirm_todos", "scope_changed"].includes(state.blocked?.reason)) fail("nothing to confirm: the run is not waiting for TODO confirmation");
+  const i = args.indexOf("--user-said");
+  const userSaid = i >= 0 ? String(args[i + 1] ?? "").trim() : "";
+  if (!userSaid) fail("record the user's approval: confirm <run> --user-said '<what they said, verbatim>'");
+  if (state.blocked.reason === "scope_changed") {
+    const current = confirmedHashes(runDir);
+    const reviewed = ["spec", "todoDev"].filter((k) => current[k] !== state.confirmed.hashes[k]);
+    if (reviewed.length) fail(`${reviewed.join(" and ")} changed since the user confirmed; no reviewer has checked the new content. Restore it, or run rule --decision replan.`);
+  }
+  const problems = [...specProblems(readRunFile(runDir, SPEC)), ...todoGaps(runDir).map((g) => g.problem)];
+  if (problems.length) fail(`cannot confirm: ${problems.join("; ")}. Fix spec.md and replan.`);
+  const questions = openQuestions(runDir);
+  if (questions.length) fail(`cannot confirm while todo-dev.md has open questions: ${questions.join("; ")}. Ask the user, record the answers in spec.md, then replan.`);
+  state.blocked = null;
+  state.confirmed = { at: now(), userSaid, hashes: confirmedHashes(runDir) };
+  (state.confirmations ??= []).push(state.confirmed);
+  assertLock();
+  save(runDir, state);
+  print({ action: "confirmed", next: "Development starts. Run next with --wait." });
+}
+
 function cmdStatus(runDir) {
   const s = load(runDir);
   print({
@@ -914,6 +1159,9 @@ switch (command) {
   case "retry":
     await locked(cmdRetry);
     break;
+  case "confirm":
+    await locked((runDir) => cmdConfirm(runDir, rest));
+    break;
   case "status":
     cmdStatus(runDirOf(runArg));
     break;
@@ -930,5 +1178,5 @@ switch (command) {
     }
     break;
   default:
-    fail("usage: denken.mjs <new|start|next|rule|retry|status> ...");
+    fail("usage: denken.mjs <new|start|next|confirm|rule|retry|status> ...");
 }
