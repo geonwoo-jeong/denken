@@ -21,18 +21,18 @@ You never plan, code, review, test or document yourself. You never edit a run's 
 | --- | --- | --- | --- | --- | --- |
 | DENKEN | Orchestrator (you) | the user's answers | `spec.md` | the agent you run in | this file |
 | METHODE | Planning worker | `spec.md` | `todo-dev.md`, `todo-qa.md` | Claude | [roles/methode.md](roles/methode.md) |
-| STARK | Development worker | `todo-dev.md` only | code, unit tests, `dev-report.md` | Codex | [roles/stark.md](roles/stark.md) |
+| STARK | Development worker | `todo-dev.md` only | code, unit tests, `dev-report.md`, ticks in `todo-dev.md` | Codex | [roles/stark.md](roles/stark.md) |
 | GENAU | Independent QA | `spec.md`, `todo-qa.md` | QA report | the other provider from STARK | [roles/genau.md](roles/genau.md) |
 | SERIE | Wiki / knowledge worker | spec, TODO, reports, code | docs, `wiki-report.md` | Claude | [roles/serie.md](roles/serie.md) |
 | RICHTER | Planning reviewer, read-only | `spec.md`, both TODO lists | reviews | the other provider from METHODE | [roles/richter.md](roles/richter.md) |
-| UBEL | Development reviewer, read-only | `spec.md`, `todo-dev.md`, `dev-report.md`, the diff | reviews | the other provider from STARK | [roles/ubel.md](roles/ubel.md) |
+| UBEL | Development reviewer, read-only: code, TODO status and change scope against the plan | `spec.md`, `todo-dev.md`, `dev-report.md`, the diff, scope facts | reviews | the other provider from STARK | [roles/ubel.md](roles/ubel.md) |
 | FRIEREN | Wiki reviewer, read-only | `spec.md`, `wiki-report.md`, the diff | reviews | the other provider from SERIE | [roles/frieren.md](roles/frieren.md) |
 
 ```text
 spec    DENKEN ⇄ user                          spec.md: in scope (S1..), out of scope (X1..)
 plan    METHODE ⇄ RICHTER                      todo-dev.md (D1..), todo-qa.md (Q1..)
         user confirms the scope and both TODO lists
-dev     STARK ⇄ UBEL                           code + unit tests, from todo-dev.md only
+dev     STARK ⇄ UBEL                           item by item: build, test, tick off; from todo-dev.md only
 qa      GENAU                                  runs todo-qa.md; a failure goes back to dev
 wiki    SERIE ⇄ FRIEREN
 done    approved results only
@@ -44,6 +44,7 @@ done    approved results only
 - **Read-only review:** a Claude reviewer gets only Read, Grep and Glob; a Codex reviewer runs in its read-only sandbox. If a reviewer or QA call changes a project file, the engine rejects the call. If any call changes DENKEN's own files, the engine rejects it and restores those files. METHODE may not change project files either.
 - **Approval gate:** a stage advances only when its review has zero blocking findings. Nonblocking findings are deferred to the summary.
 - **Spec coverage:** before a reviewer sees the TODO lists, the engine checks them against the spec: the lists are well formed, every S item has a D item and a Q item, the Acceptance and Do not build sections copy the S and X items word for word, and no D item builds an X item. Gaps go straight back to METHODE. QA must report every Q item, and only Q items; a missing item counts as a failure.
+- **Item-by-item development:** STARK builds one D item at a time and ticks it off with `denken.mjs tick`, which runs the item's unit tests and ticks it only if they pass, recording the command and output. STARK cannot edit `todo-dev.md` itself. An item that is neither ticked with a recorded passing run nor reported blocked goes straight back to STARK. After a QA failure the engine unticks the items that serve the failing S item. UBEL gets engine-computed facts: each item's status and test command, the changed files against the files the items name, and signs of weakened tests.
 - **Confirmation gate:** after the plan passes review, the run stops until the user confirms the scope and both TODO lists. The engine records the user's words and the exact content confirmed, and stops again if that content changes afterwards. In Claude Code, an `ask` permission rule for `Bash(node *denken.mjs confirm*)` turns the confirmation into a real permission prompt; nothing enforces this in bypass-permissions mode.
 - **You step in:** the engine stops and asks you for a ruling when the same topic is raised `limits.topicRepeats` times (default 3), when the number of blocking findings stops going down, or when a stage reaches `limits.roundsPerStage` rounds (default 5).
 - **Limits and safety:** each call times out after `limits.callTimeoutMin` minutes (default 60). Only one engine process works on a run at a time. Network access is set per role: STARK and GENAU have it by default, METHODE and SERIE do not, and reviewers never do.

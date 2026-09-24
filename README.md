@@ -27,7 +27,7 @@ npx skills add geonwoo-jeong/denken --skill <name> -g -a claude-code
 spec    DENKEN ⇄ you          spec.md: in scope (S1..), out of scope (X1..)
 plan    METHODE ⇄ RICHTER     todo-dev.md (D1..), todo-qa.md (Q1..)
         you confirm the scope and both TODO lists
-dev     STARK ⇄ UBEL          code + unit tests, built from todo-dev.md only
+dev     STARK ⇄ UBEL          item by item: build, unit test, tick off (todo-dev.md only)
 qa      GENAU                 runs todo-qa.md; a failure goes back to dev
 wiki    SERIE ⇄ FRIEREN
 done    approved results only
@@ -37,7 +37,7 @@ done    approved results only
 | ---- | ---- | ---------------- |
 | DENKEN | Orchestrator. The only agent you talk to; asks what it needs and writes the spec | the agent you run it in |
 | METHODE | Planning worker: turns the spec into a development TODO and a QA TODO | Claude |
-| STARK | Development worker: builds the development TODO, unit tests included | Codex |
+| STARK | Development worker: builds the development TODO item by item (build, unit test, tick off) | Codex |
 | SERIE | Wiki / knowledge worker | Claude |
 | RICHTER | Planning reviewer: checks the TODO lists against the spec, read-only | the other provider from METHODE |
 | UBEL | Development reviewer: checks code, TODO status and change scope against the plan, read-only | the other provider from STARK |

@@ -512,3 +512,123 @@ test("after a QA failure, the dev reviewer checks that the fix is general", () =
   assert.match(prompt, /qa-genau-1\.failures\.json/);
   assert.match(prompt, /special-casing/);
 });
+
+test("STARK ticks D items off in todo-dev.md, and may change nothing else there", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  const todo = readFileSync(join(t.proj, t.run, "todo-dev.md"), "utf8");
+  assert.match(todo, /- \[x\] D1 \(S1\)/);
+  assert.match(todo, /- \[x\] D2 \(S2\)/);
+  // Ticking is not a change to what the user confirmed.
+  assert.ok(!t.calls().some((c) => c.includes("dev-stark-2")));
+});
+
+test("a D item neither ticked off nor reported blocked goes straight back to STARK", () => {
+  const t = setup({ "dev-stark-1": { tick: [1] } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  const calls = t.calls();
+  assert.deepEqual(calls.slice(calls.indexOf("codex dev-stark-1 rw"), calls.indexOf("codex dev-stark-1 rw") + 3), ["codex dev-stark-1 rw", "codex dev-stark-2 rw", "claude dev-ubel-2 ro"]);
+  const gaps = JSON.parse(readFileSync(join(t.proj, t.run, "calls", "dev-stark-1.gaps.json"), "utf8"));
+  assert.deepEqual(gaps.findings.map((f) => f.identity), ["todo-D2"]);
+});
+
+test("a D item reported blocked goes to UBEL, who sees each item's status and the change scope", () => {
+  const todoDev = "## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) build one. Files: `lib/one.js`, `test/one.test.js`.\n- [ ] D2 (S2) build two. Files: `src.txt`.\n  - sub-note naming `lib/extra.js`\n\n## Open questions\n- None\n";
+  const t = setup({ "plan-methode-1": { todoDev }, "dev-stark-1": { tick: [1], report: "## TODO status\n- D1 done\n- D2 blocked: needs a design decision\n" } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  assert.ok(t.calls().includes("claude dev-ubel-1 ro"));
+  const prompt = readFileSync(join(t.proj, t.run, "calls", "dev-ubel-1.prompt.md"), "utf8");
+  assert.match(prompt, /TODO status and recorded test runs: D1 \[x\], test run: `echo ok` exit 0 \(ok\), D2 \[ \] reported blocked/);
+  assert.match(prompt, /Files changed in this stage: src\.txt/);
+  assert.match(prompt, /Changed files that no D item names: none/);
+  assert.match(prompt, /Ticked D items none of whose named files changed: D1 \(lib\/one\.js, test\/one\.test\.js\)/);
+  assert.match(prompt, /Ticked D items with no named test file added or changed: D1\./);
+});
+
+test("UBEL is told about changed files that no D item names", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  t.drive();
+  assert.match(readFileSync(join(t.proj, t.run, "calls", "dev-ubel-1.prompt.md"), "utf8"), /Changed files that no D item names: src\.txt\./);
+});
+
+test("a tick without a recorded passing test run, or a failing one, goes back to STARK", () => {
+  const t = setup({ "dev-stark-1": { tickByHand: [1], tickFail: [2] } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  const gaps = JSON.parse(readFileSync(join(t.proj, t.run, "calls", "dev-stark-1.gaps.json"), "utf8")).findings;
+  assert.deepEqual(gaps.map((g) => [g.identity, g.problem]), [
+    ["todo-D1", "D1 is ticked, but no passing test run was recorded for it"],
+    ["todo-D2", "D2 is neither ticked off nor reported blocked in dev-report.md"],
+  ]);
+  assert.match(readFileSync(join(t.proj, t.run, "calls", "dev-stark-1.tick-D2.log"), "utf8"), /\[exit 1\]/);
+  assert.ok(!t.calls().includes("claude dev-ubel-1 ro"));
+});
+
+test("STARK may only tick D items in the TODO section: unticking or ticking other lines is undone", () => {
+  const t = setup({ "dev-ubel-1": changes(finding("x")), "dev-stark-2": { untickByHand: [1], tick: [] } });
+  t.denken("start", t.run);
+  const r = t.drive();
+  assert.equal(r.reason, "guard_violation");
+  assert.equal(r.call, "dev-stark-2");
+  assert.match(readFileSync(join(t.proj, t.run, "todo-dev.md"), "utf8"), /- \[x\] D1/);
+
+  const todoDev = "## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) one\n- [ ] D2 (S2) two\n- [ ] note: keep it small\n\n## Open questions\n- None\n";
+  const u = setup({ "plan-methode-1": { todoDev }, "dev-stark-1": { tickOther: "note" } });
+  u.denken("start", u.run);
+  assert.equal(u.drive().reason, "guard_violation");
+});
+
+test("after a QA failure the engine unticks the D items for the failing spec item", () => {
+  const t = setup({ "qa-genau-1": { qa: { result: "FAIL", items: [qaItem(1), qaItem(2, "FAIL")] } }, "dev-stark-2": { tick: [] } });
+  t.denken("start", t.run);
+  t.drive();
+  // D2 serves S2 and was unticked; STARK's second round did not re-tick it with a test run.
+  const gaps = JSON.parse(readFileSync(join(t.proj, t.run, "calls", "dev-stark-2.gaps.json"), "utf8")).findings;
+  assert.deepEqual(gaps.map((g) => g.identity), ["todo-D2"]);
+  assert.ok(t.state().untickedAt.D2);
+  assert.ok(!t.state().untickedAt.D1);
+});
+
+test("the tick command refuses outside a development call", () => {
+  const t = setup();
+  t.denken("start", t.run);
+  const r = t.denken("tick", t.run, "D1", "--", "true");
+  assert.equal(r.status, 1);
+  assert.match(r.json.error, /only for STARK|for STARK, during a development call/);
+});
+
+test("UBEL is told about deleted test lines, added skip markers, and files under a named directory", () => {
+  const todoDev = "## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) one. Files: `lib/`, `test/b.test.js`.\n- [ ] D2 (S2) two.\n\n## Open questions\n- None\n";
+  const t = setup({ "plan-methode-1": { todoDev }, "dev-stark-1": { editFiles: { "lib/x.js": "export const x = 1;\n", "test/b.test.js": "test.skip('one', () => {});\n" } } });
+  mkdirSync(join(t.proj, "test"));
+  writeFileSync(join(t.proj, "test", "b.test.js"), "test('one', () => {});\ntest('two', () => {});\n");
+  t.sh("git", "add", ".");
+  t.sh("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "tests");
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  const prompt = readFileSync(join(t.proj, t.run, "calls", "dev-ubel-1.prompt.md"), "utf8");
+  assert.match(prompt, /Changed files that no D item names: src\.txt\./);
+  assert.match(prompt, /Ticked D items that name no files: D2\./);
+  assert.match(prompt, /Lines deleted from test files: test\/b\.test\.js \(2\)/);
+  assert.match(prompt, /Skip markers added: test\/b\.test\.js: test\.skip\('one', \(\) => \{\}\);/);
+});
+
+test("the tick command runs its argv without a shell", () => {
+  const t = setup({ "dev-stark-1": { tickArgs: ["node", "-e", "console.log(process.argv[1]); process.exit(process.argv[1] === 'login flow' ? 0 : 1)", "login flow"] } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  const ledger = readFileSync(join(t.proj, t.run, "calls", "dev-stark-1.ticks.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(ledger.map((e) => [e.item, e.lastLine]), [["D1", "login flow"], ["D2", "login flow"]]);
+  assert.match(ledger[0].command, /'login flow'$/);
+
+  // "|| true" is just more arguments to false, so the failure stands and nothing is ticked.
+  const u = setup({ "dev-stark-1": { tickArgs: ["false", "||", "true"] } });
+  u.denken("start", u.run);
+  u.drive();
+  const gaps = JSON.parse(readFileSync(join(u.proj, u.run, "calls", "dev-stark-1.gaps.json"), "utf8")).findings;
+  assert.deepEqual(gaps.map((g) => g.identity), ["todo-D1", "todo-D2"]);
+});

@@ -13,6 +13,7 @@
 //   (start, next, rule and retry take a per-run lock, so only one engine process works on a run.)
 //   node denken.mjs retry <run>                 resume after a needs_user block
 //   node denken.mjs status <run>                compact summary
+//   node denken.mjs tick <run> D<n> -- <cmd>    STARK, during its call: run the item's tests, tick it on success
 //
 // Actions printed by next: running | needs_ruling | needs_user | done | aborted.
 // Run files: spec.md (DENKEN) -> todo-dev.md + todo-qa.md (METHODE) -> user confirms -> dev, qa, wiki.
@@ -142,8 +143,11 @@ function violations(before, after, guard, runDir, pinned) {
     if (watched(f) && hashFile(join(ROOT, f)) !== h) found.push(`ignored file changed: ${f}`);
   }
   const allowed = new Set(guard.allow.map((f) => relative(ROOT, join(runDir, f))));
+  // STARK may tick D items off in todo-dev.md, and change nothing else in it.
+  const checkboxOnly = new Set((guard.checkboxOnly ?? []).map((f) => relative(ROOT, join(runDir, f))));
   for (const f of new Set([...Object.keys(before.owned), ...Object.keys(after.owned)])) {
     if (before.owned[f] === after.owned[f] || allowed.has(f)) continue;
+    if (checkboxOnly.has(f) && f in pinned && existsSync(join(ROOT, f)) && onlyTicks(pinned[f].toString(), readFileSync(join(ROOT, f), "utf8"))) continue;
     const path = join(ROOT, f);
     if (f in pinned) writeFileSync(path, pinned[f]);
     else if (!(f in before.owned)) rmSync(path, { force: true });
@@ -206,6 +210,11 @@ function parseTodos(text, letter) {
   const problems = [];
   if (body === null) problems.push({ key: "section", problem: `the "## ${ITEM_SECTION[letter]}" section is missing` });
   for (const line of (body ?? "").split("\n")) {
+    // Indented lines under an item (its sub-bullets and notes) belong to that item.
+    if (items.length && /^\s{2,}\S/.test(line) && !new RegExp(`^\\s*[-*]\\s*(?:\\[[ xX]\\]\\s*)?[*_\`]*${letter}\\d+\\b`).test(line)) {
+      items.at(-1).block += `\n${line}`;
+      continue;
+    }
     const m = line.match(new RegExp(`^\\s*[-*]\\s*\\[([ xX])\\]\\s*[*_\`]*${letter}(\\d+)\\b[*_\`]*\\s*[:.]?\\s*(?:\\(([^)]*)\\))?(.*)$`));
     if (!m) {
       const loose = line.match(new RegExp(`^\\s*[-*]\\s*[*_\`]*${letter}(\\d+)\\b`));
@@ -217,7 +226,7 @@ function parseTodos(text, letter) {
       problems.push({ key: `${letter}${id}`, problem: `${letter}${id} appears more than once` });
       continue;
     }
-    items.push({ id, done: m[1] !== " ", refs: (m[3] ?? "").match(/[SX]\d+/g) ?? [], text: m[4].trim() });
+    items.push({ id, done: m[1] !== " ", refs: (m[3] ?? "").match(/[SX]\d+/g) ?? [], text: m[4].trim(), block: line });
   }
   return { items, problems };
 }
@@ -242,8 +251,9 @@ function specProblems(text) {
 }
 
 // The TODO lists as confirmed: checkbox state is ignored, so STARK ticking items off is not a change.
+const untick = (text) => text.replace(/^(\s*[-*]\s*)\[[xX]\]/gm, "$1[ ]");
+
 function confirmedHashes(runDir) {
-  const untick = (text) => text.replace(/^(\s*[-*]\s*)\[[xX]\]/gm, "$1[ ]");
   return { spec: sha(readRunFile(runDir, SPEC)), todoDev: sha(untick(readRunFile(runDir, TODO_DEV))), todoQa: sha(untick(readRunFile(runDir, TODO_QA))) };
 }
 
@@ -297,6 +307,172 @@ function todoGaps(runDir) {
   return gaps;
 }
 
+// ---------- ticking D items off, with evidence
+// STARK ticks an item off only through `denken.mjs tick`, which runs the item's test command and
+// ticks the item only when it passes, recording the run in a ledger (calls/<call>.ticks.jsonl,
+// with the output in calls/<call>.tick-D<n>.log). A tick without a matching ledger entry is not
+// accepted. Unticking belongs to the engine, after a QA failure.
+
+const D_LINE = /^\s*[-*]\s*\[([ xX])\]\s*[*_`]*D(\d+)\b/;
+const blockedIn = (report, id) => new RegExp(`\\bD${id}\\b[^\\n]*\\bblocked\\b`, "i").test(report);
+
+// The only edit STARK may make to todo-dev.md: D lines in the TODO section going from [ ] to [x].
+function onlyTicks(beforeText, afterText) {
+  const before = beforeText.split("\n");
+  const after = afterText.split("\n");
+  if (before.length !== after.length) return false;
+  const start = before.findIndex((l) => /^##\s+TODO\s*$/i.test(l.trim()));
+  const end = before.findIndex((l, i) => i > start && /^##\s/.test(l));
+  for (let i = 0; i < before.length; i++) {
+    if (before[i] === after[i]) continue;
+    const inTodo = start >= 0 && i > start && (end < 0 || i < end);
+    const m = before[i].match(D_LINE);
+    if (!inTodo || !m || m[1] !== " " || after[i] !== before[i].replace("[ ]", "[x]")) return false;
+  }
+  return true;
+}
+
+function setTick(runDir, id, ticked) {
+  const path = join(runDir, TODO_DEV);
+  const lines = readFileSync(path, "utf8").split("\n");
+  const start = lines.findIndex((l) => /^##\s+TODO\s*$/i.test(l.trim()));
+  for (let i = start + 1; start >= 0 && i < lines.length && !/^##\s/.test(lines[i]); i++) {
+    const m = lines[i].match(D_LINE);
+    if (m && Number(m[2]) === id) {
+      lines[i] = lines[i].replace(/\[[ xX]\]/, ticked ? "[x]" : "[ ]");
+      writeFileSync(path, lines.join("\n"));
+      return true;
+    }
+  }
+  return false;
+}
+
+// Ledger entries whose output log is intact, keyed by item, latest first wins.
+function tickLedger(runDir) {
+  const entries = new Map();
+  for (const f of existsSync(join(runDir, "calls")) ? readdirSync(join(runDir, "calls")) : []) {
+    if (!/^dev-stark-\d+\.ticks\.jsonl$/.test(f)) continue;
+    for (const line of readFileSync(join(runDir, "calls", f), "utf8").split("\n").filter(Boolean)) {
+      try {
+        const e = JSON.parse(line);
+        if (e.exitCode === 0 && hashFile(join(runDir, "calls", e.log)) === e.logSha && (!entries.has(e.item) || e.at > entries.get(e.item).at)) entries.set(e.item, e);
+      } catch {}
+    }
+  }
+  return entries;
+}
+
+// After STARK's call: every D item is either ticked off with a recorded passing test run since
+// it was last unticked, or reported blocked in dev-report.md.
+function devGaps(runDir, state) {
+  const report = readRunFile(runDir, "dev-report.md");
+  const ledger = tickLedger(runDir);
+  const since = (id) => state.untickedAt?.[`D${id}`] ?? state.stageEnteredAt?.dev ?? "";
+  const gaps = [];
+  for (const d of parseTodos(readRunFile(runDir, TODO_DEV), "D").items) {
+    const base = { identity: `todo-D${d.id}`, severity: "blocking", topic: `todo-D${d.id}`, file: TODO_DEV, line_start: null, line_end: null, spec_item: Number(d.refs.find((r) => r[0] === "S")?.slice(1)) || null, todo: `D${d.id}`, source: "engine" };
+    const entry = ledger.get(`D${d.id}`);
+    if (!d.done && !blockedIn(report, d.id)) {
+      gaps.push({ ...base, problem: `D${d.id} is neither ticked off nor reported blocked in dev-report.md`, required_change: `Finish D${d.id} and tick it off with the tick command, or report "D${d.id} blocked: <reason>" in dev-report.md.` });
+    } else if (d.done && !(entry && entry.at > since(d.id))) {
+      gaps.push({ ...base, problem: `D${d.id} is ticked, but no passing test run was recorded for it`, required_change: `Tick D${d.id} off only with the tick command, which runs its unit tests.` });
+    }
+  }
+  return gaps;
+}
+
+// Facts for UBEL: each D item's status and test run, the change's scope against the files the
+// D items name, and signs of weakened tests.
+const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|[._-](test|spec)\.\w+$|_test\.\w+$/;
+const SKIP_MARKER = /\.skip\(|\bxit\(|\bxdescribe\(|\bxtest\(|@pytest\.mark\.skip|\bt\.Skip\(|skip:\s*true|\.todo\(/;
+
+function scopeReport(runDir, state) {
+  const lines = (text) => text.split("\n").filter(Boolean);
+  const base = state.stageBase.dev || EMPTY_TREE;
+  const untrackedBefore = new Set(state.untrackedAtStage?.dev ?? []);
+  const untracked = lines(gitText("ls-files", "--others", "--exclude-standard", "--", ".", NOT_DENKEN)).filter((f) => !untrackedBefore.has(f));
+  const changed = [...new Set([...lines(gitText("diff", "--name-only", base, "--", ".", NOT_DENKEN)), ...untracked])];
+  const report = readRunFile(runDir, "dev-report.md");
+  const ledger = tickLedger(runDir);
+  const items = parseTodos(readRunFile(runDir, TODO_DEV), "D").items;
+  const pathLike = (t) => /^[\w.\/-]+$/.test(t) && (t.includes("/") || /\.\w+$/.test(t));
+  // A name without an extension is taken as a directory, and covers everything under it.
+  const covers = (name, file) => file === name || (!/\.\w+$/.test(name) && file.startsWith(`${name.replace(/\/$/, "")}/`));
+  const named = new Map(items.map((d) => [d.id, [...d.block.matchAll(/`([^`]+)`/g)].map((m) => m[1]).filter(pathLike)]));
+  const allNamed = [...named.values()].flat();
+  const ticked = items.filter((d) => d.done);
+
+  const status = items.map((d) => {
+    const e = ledger.get(`D${d.id}`);
+    const run = e ? `, test run: \`${e.command}\` exit 0 (${e.lastLine || "no output"})` : "";
+    return `D${d.id} ${d.done ? "[x]" : "[ ]"}${!d.done && blockedIn(report, d.id) ? " reported blocked" : ""}${run}`;
+  });
+  const unnamed = changed.filter((f) => !allNamed.some((n) => covers(n, f)));
+  const untouched = ticked.filter((d) => named.get(d.id).length && !named.get(d.id).some((n) => changed.some((f) => covers(n, f))));
+  const nameless = ticked.filter((d) => !named.get(d.id).length);
+  const untested = ticked.filter((d) => !named.get(d.id).some((n) => TEST_FILE.test(n) && changed.some((f) => covers(n, f))));
+
+  const diff = git("diff", base, "--", ".", NOT_DENKEN).toString("utf8");
+  const deletions = new Map();
+  const skips = [];
+  let file = null;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ ")) file = line.replace(/^\+\+\+ (b\/)?/, "");
+    else if (line.startsWith("--- ")) continue;
+    else if (file && TEST_FILE.test(file) && line.startsWith("-") && line.slice(1).trim()) deletions.set(file, (deletions.get(file) ?? 0) + 1);
+    else if (file && line.startsWith("+") && SKIP_MARKER.test(line)) skips.push(`${file}: ${line.slice(1).trim().slice(0, 80)}`);
+  }
+  for (const f of untracked.filter((f) => TEST_FILE.test(f))) {
+    for (const line of readFileSync(join(ROOT, f), "utf8").split("\n")) if (SKIP_MARKER.test(line)) skips.push(`${f}: ${line.trim().slice(0, 80)}`);
+  }
+  const list = (xs, fmt = (x) => x) => (xs.length ? xs.map(fmt).join(", ") : "none");
+  const withFiles = (d) => `D${d.id} (${named.get(d.id).join(", ")})`;
+  return [
+    `TODO status and recorded test runs: ${list(status)}`,
+    `Files changed in this stage: ${list(changed)}`,
+    `Changed files that no D item names: ${list(unnamed)}. Judge whether each belongs to the plan.`,
+    `Ticked D items none of whose named files changed: ${list(untouched, withFiles)}. Check that they were really done.`,
+    `Ticked D items that name no files: ${list(nameless, (d) => `D${d.id}`)}.`,
+    `Ticked D items with no named test file added or changed: ${list(untested, (d) => `D${d.id}`)}.`,
+    `Lines deleted from test files: ${list([...deletions], ([f, n]) => `${f} (${n})`)}. Check that no test was weakened.`,
+    `Skip markers added: ${list(skips)}.`,
+  ].join("\n  ");
+}
+
+// `tick <run> D<n> -- <test command>`: run by STARK, inside its own sandbox, during its call.
+function cmdTick(runDir, args) {
+  const state = load(runDir);
+  const call = state.inflight;
+  if (call?.stage !== "dev" || call.mode !== "work") fail("tick is for STARK, during a development call");
+  const item = String(args[0] ?? "");
+  const sep = args.indexOf("--");
+  // The command runs as the argv given, with no shell, so "|| true" or "; exit 0" cannot turn a
+  // failure into a tick, and quoted arguments reach the test runner intact.
+  const argv = sep >= 0 ? args.slice(sep + 1) : [];
+  if (!/^D\d+$/.test(item) || !argv.length) fail("usage: tick <run> D<n> -- <command> <args...>  (the command that runs the item's unit tests)");
+  const command = argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, "'\\''")}'`)).join(" ");
+  const d = parseTodos(readRunFile(runDir, TODO_DEV), "D").items.find((x) => `D${x.id}` === item);
+  if (!d) fail(`${item} is not an item in the TODO section of todo-dev.md`);
+  const base = callBase(runDir, call.id);
+  const log = `${call.id}.tick-${item}.log`;
+  const r = spawnSync(argv[0], argv.slice(1), { cwd: ROOT, encoding: "utf8", maxBuffer: 1 << 26 });
+  if (r.error?.code === "ENOENT") {
+    fail(`command not found: ${argv[0]}. Pass the command and its arguments as separate words after --, not as one quoted string; write sh -c '...' explicitly if you need a shell.`);
+  }
+  writeFileSync(join(runDir, "calls", log), `$ ${command}\n--- stdout ---\n${r.stdout ?? ""}\n--- stderr ---\n${r.stderr ?? ""}\n[exit ${r.status}]\n`);
+  if (r.status !== 0) {
+    print({ action: "not_ticked", item, exitCode: r.status, log: join(runDir, "calls", log), next: "Fix the failure, then run tick again." });
+    process.exit(1);
+  }
+  setTick(runDir, d.id, true);
+  // Record the test runner's pass/fail summary (e.g. "ℹ pass 10 / ℹ fail 0"), else stdout's last line.
+  const out = ((r.stdout ?? "").trim() || (r.stderr ?? "").trim()).split("\n").filter(Boolean);
+  const summary = out.filter((l) => /\b(pass(ed|es)?|fail(ed|ures?)?|tests?)\b/i.test(l)).slice(-2).join(" / ");
+  const lastLine = (summary || out.at(-1) || "").slice(0, 160);
+  appendFileSync(`${base}.ticks.jsonl`, `${JSON.stringify({ item, command, exitCode: 0, at: now(), lastLine, log, logSha: hashFile(join(runDir, "calls", log)) })}\n`);
+  print({ action: "ticked", item, lastLine });
+}
+
 // ---------- prompts
 
 function knownTopics(state, stage) {
@@ -325,7 +501,10 @@ function buildCall(runDir, state, call) {
     write.push(...ARTIFACTS[call.stage].map(p));
     guard.allow.push(...ARTIFACTS[call.stage]);
     if (call.stage === "plan") extra.push(`Do not change any project file. Write only ${TODO_DEV} and ${TODO_QA}.`);
-    if (call.stage === "dev") extra.push(`Do not edit ${TODO_DEV}; report each D item's status in dev-report.md.`);
+    if (call.stage === "dev") {
+      guard.checkboxOnly = [TODO_DEV];
+      extra.push(`When a D item is built, tick it off by running its unit tests through the engine: node "${SCRIPT}" tick "${runDir}" D<n> -- <command> <args...> (for example: -- node --test test/a.test.js). The command runs as given, without a shell. It ticks the item only if the command passes, and records the run. Do not edit ${TODO_DEV} yourself.`);
+    }
   } else if (call.mode === "review") {
     read.push(p(SPEC));
     if (call.stage === "dev") read.push(p(TODO_DEV));
@@ -337,6 +516,7 @@ function buildCall(runDir, state, call) {
       read.push(diffPath);
     }
     if (lastReview) read.push(lastReview);
+    if (call.stage === "dev") extra.push(`Scope facts computed by the engine:\n  ${scopeReport(runDir, state)}`);
     if (call.stage === "dev" && state.devInput === "qa") {
       read.push(state.lastQaFailures);
       extra.push("This round fixes failed QA checks (listed in the failures file). Check that each fix is general: no special-casing of the reported inputs, no hard-coded expected outputs, no weakened or deleted tests.");
@@ -595,6 +775,8 @@ function enterStage(state, stage) {
   state.pending = "work";
   if (stage === "dev" || stage === "wiki") {
     state.stageBase[stage] = gitText("stash", "create") || gitText("rev-parse", "-q", "--verify", "HEAD") || EMPTY_TREE;
+    (state.stageEnteredAt ??= {})[stage] = now();
+    (state.untrackedAtStage ??= {})[stage] = gitText("ls-files", "--others", "--exclude-standard", "--", ".", NOT_DENKEN).split("\n").filter(Boolean);
   }
 }
 
@@ -683,14 +865,16 @@ function ingest(runDir, state, meta) {
     state.lastWork[stage] = { call: call.id, denials: meta.denials };
     state.pending = "review";
     // Deterministic checks run before the reviewer: TODO lists with coverage gaps go straight
-    // back to METHODE as an engine round, without spending a review on them.
-    if (stage === "plan") {
-      const gaps = todoGaps(runDir);
+    // back to METHODE, and D items STARK neither ticked off nor reported blocked go straight
+    // back to STARK, as an engine round, without spending a review on them.
+    if (stage === "plan" || stage === "dev") {
+      const gaps = stage === "plan" ? todoGaps(runDir) : devGaps(runDir, state);
       if (gaps.length) {
         const gapsPath = `${base}.gaps.json`;
         writeFileSync(gapsPath, JSON.stringify({ verdict: "CHANGES_REQUESTED", findings: gaps, checked: ["engine coverage check of the TODO lists against spec.md"] }, null, 2));
-        state.lastReview.plan = gapsPath;
-        recordReview(state, "plan", call, gaps);
+        state.lastReview[stage] = gapsPath;
+        if (stage === "dev") state.devInput = "review";
+        recordReview(state, stage, call, gaps);
         return;
       }
     }
@@ -720,6 +904,15 @@ function ingest(runDir, state, meta) {
     // The dev stage's diff base is kept so the next review sees every change since dev began.
     state.lastQaFailures = `${base}.failures.json`;
     writeFileSync(state.lastQaFailures, JSON.stringify(failing.map(({ id, spec_item, check, evidence, reproduce }) => ({ qa_item: `Q${id}`, spec_item, check, evidence, reproduce })), null, 2));
+    // The checkboxes must stay truthful: D items serving a failing S item are unticked, and
+    // need a fresh passing test run to be ticked again.
+    const qRefs = new Map(parseTodos(readRunFile(runDir, TODO_QA), "Q").items.map((q) => [q.id, q.refs]));
+    const failingS = new Set(failing.flatMap((c) => (Number.isInteger(c.spec_item) ? [`S${c.spec_item}`] : (qRefs.get(c.id) ?? []).filter((r) => r[0] === "S"))));
+    for (const d of parseTodos(readRunFile(runDir, TODO_DEV), "D").items) {
+      if (d.done && d.refs.some((r) => failingS.has(r)) && setTick(runDir, d.id, false)) {
+        (state.untickedAt ??= {})[`D${d.id}`] = now();
+      }
+    }
     state.approved.dev = null;
     state.devInput = "qa";
     state.stage = "dev";
@@ -1164,6 +1357,9 @@ switch (command) {
     break;
   case "status":
     cmdStatus(runDirOf(runArg));
+    break;
+  case "tick":
+    cmdTick(runDirOf(runArg), rest);
     break;
   case "_exec":
     try {
