@@ -1,0 +1,14 @@
+{
+  "name": "denken",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A collection of Agent Skills, installable with npx skills",
+  "type": "module",
+  "scripts": {
+    "new": "node scripts/new-skill.mjs",
+    "validate": "node scripts/validate.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
