@@ -28,6 +28,7 @@ You never plan, code, review, test or document yourself. You never edit a run's 
 | SERIE | Wiki / knowledge worker | the files this run changed, the docs that mention them, request, TODO, reports | docs, `wiki-report.md` | Claude | [roles/serie.md](roles/serie.md) |
 | RICHTER | Planning reviewer, read-only | `request.md`, both TODO lists | reviews | the other provider from METHODE | [roles/richter.md](roles/richter.md) |
 | UBEL | Development reviewer, read-only: code, TODO status and evidence, and change scope against the plan | `request.md`, `todo-dev.md`, `dev-report.md`, the diff, scope facts | reviews | the other provider from STARK | [roles/ubel.md](roles/ubel.md) |
+| FLAMME | Seed AI: once per stage, reads a role's context into a seed session that the role's calls fork | the role's own inputs, and the project's layout and conventions | a seed session, nothing in the project | runs as the role it seeds; on for Claude, off for Codex | [roles/flamme.md](roles/flamme.md) |
 | FRIEREN | Wiki reviewer, read-only: do the docs match the code? | `request.md`, `wiki-report.md`, the doc diff, the changed code | reviews | the other provider from SERIE | [roles/frieren.md](roles/frieren.md) |
 
 ```text
@@ -112,6 +113,21 @@ node <skill-dir>/scripts/config.mjs set limits.topicRepeats 2  # also roundsPerS
 
 Add `--local` to change only this machine's settings, or `--global` for defaults across all projects.
 
+## Seeds: FLAMME
+
+FLAMME, the seed AI, reads a role's context once per stage into a seed session: the role's own inputs, and the project's layout and conventions. Every call of that role in the stage then forks the seed, does its work, and is thrown away. Each call starts from the same clean point, without the noise of earlier calls. On Claude, the fork reads the seed from the prompt cache instead of paying for it again.
+
+- **One seed per role:** a worker never forks a checker's seed, which holds the request, and FLAMME reads only what the role itself may read. So STARK's seed has `todo-dev.md` and the code, not `request.md`.
+- **Claude and Codex differ:**
+  - A Claude fork has exactly its seed's flags (model, effort, tools, settings), so it hits the seed's cache. Its role instructions are in its message, because a forked session keeps the seed's system prompt.
+  - Codex keys its cache by session, so a fork re-reads the whole seed uncached; seeding costs more there than it saves, and is off by default. When it is on, every Codex fork sets its own sandbox, which it would otherwise inherit from the seed.
+- **When to use it:** seeds pay off when a role's context is large and a stage takes several rounds. For a small task, start the run with `--seeds off`. `config.mjs set seeds.codex true` turns seeding on for Codex; `status` shows FLAMME's tokens beside each role's, to check.
+- **Freshness:** a seed is made again when what it read changes (ticks and evidence aside), or when the plan is redone. FLAMME loads what stays put (conventions, architecture, interfaces, and the paths of the files the work touches), and the role reads the current content of those files itself. A Claude seed idle for close to an hour is re-warmed before its next fork, and a seed's prefix is cached for an hour.
+- **No anchoring:** a checker's seed must answer in its call's schema, so it answers `CONTEXT_LOADED`, a placeholder that is never accepted as a result. The fork is told it is not a verdict.
+- **Failures:** a seed that changes a file is a guard violation. A fork that cannot start, for example because its seed is gone, runs once from scratch, and the timeline says so.
+
+No DENKEN call runs the user's hooks (`disableAllHooks`): hooks for interactive sessions, such as a summary of past work or notifications, would only add context the role must not rely on.
+
 ## Levels: the model for each stage
 
 Pick a level for each stage when you start the run, by how hard that stage's work is. The goal is to save tokens: spend them where the work is hard, and on checking.
@@ -123,7 +139,7 @@ Pick a level for each stage when you start the run, by how hard that stage's wor
 | `heavy` | Cross-cutting changes, tricky logic (concurrency, security, data migrations), or a stage that keeps failing. |
 
 ```bash
-node <skill-dir>/scripts/denken.mjs start <run> --level plan=light --level dev=heavy --level wiki=light
+node <skill-dir>/scripts/denken.mjs start <run> --level plan=light --level dev=heavy --level wiki=light [--seeds off]
 ```
 
 - A level applies to a stage (`plan`, `dev`, `qa`, `wiki`) or to one role (`--level stark=heavy`). For a specific model or effort, name the role: `--model stark=<id>`, `--effort ubel=high`. These win over the level.
@@ -322,7 +338,8 @@ ai-log/<YYYYMMDD>/<NNN>_<HHMMSS>_<name>/   the run's record, written by the engi
 ~/.cache/denken/worktrees/<project>/<run>/UNIT-n/   a unit's worktree and its own run, until the merge
   dev-report.md, wiki-report.md  STARK, SERIE
   rulings.md                     engine, from your rulings and permission decisions
-  calls/<call>.prompt.md         what each agent was sent
+  calls/<call>.prompt.md         what each agent was sent (its role's instructions are in <call>.system.md, or in the prompt when it forks a seed)
+  calls/<call>.seed.*            FLAMME's seed for the role, when this call made it: prompt, streamed log, brief
   calls/<call>.out.json|md       its final message: review or QA report (JSON), worker summary (text)
   calls/<call>.diff              the changes a dev or wiki reviewer was shown
   calls/<qa-call>.evidence/      GENAU's evidence files

@@ -373,6 +373,51 @@ function modelFamily(agent) {
 }
 const agentLabel = (a) => `${a.provider}${a.model || a.effort ? `: ${[a.model, a.effort].filter(Boolean).join(", ")}` : ""}${a.level && a.level !== "standard" ? ` [${a.level}]` : ""}`;
 
+// ---------- FLAMME: seeds
+// FLAMME, the seed AI, reads a role's context once per stage into a seed session; each call of
+// the role then forks that seed, works, and is thrown away. Every call starts from the same clean
+// point, and on Claude, whose cache is keyed by content, the fork reads the seed from the cache.
+// A seed belongs to one role, so a worker never starts from a checker's context (which holds the
+// request); it reads only the role's own inputs. Its key also holds everything that shapes the
+// call's flags (provider, model, effort, mode, network, grants, worktree), because a fork must
+// match its seed exactly to reuse the cache. The engine alone keeps the seeds, in state.json.
+const SEED_INPUTS = { methode: [REQUEST], richter: [REQUEST], stark: [TODO_DEV], ubel: [REQUEST, TODO_DEV], genau: [REQUEST, TODO_QA], serie: [REQUEST, TODO_DEV, "dev-report.md"], frieren: [REQUEST] };
+const ROLE_TITLE = { methode: "planning worker", richter: "planning reviewer", stark: "development worker", ubel: "development reviewer", genau: "independent QA", serie: "wiki worker", frieren: "wiki reviewer" };
+// A seed is made again when what it read changes (ticks and evidence aside), and a Claude seed not
+// used for close to the cache's hour is re-warmed first: its prefix would no longer be cached.
+const SEED_REWARM_MS = 55 * 60000;
+function seedFor(runDir, state, call, agent) {
+  if (!(state.seeding ?? []).includes(agent.provider)) return null;
+  const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
+  const inputs = SEED_INPUTS[call.role].map((f) => (f.startsWith("todo-") ? planText(readRunFile(runDir, f)) : readRunFile(runDir, f)));
+  const profile = sha(JSON.stringify([agent.provider, agent.model ?? null, agent.effort ?? null, call.mode, Boolean(agent.network), grants, state.mainRoot ?? null, inputs])).slice(0, 12);
+  const key = `${call.role}#${state.seedEpoch ?? 0}#${profile}`;
+  const known = state.seedSessions?.[key];
+  const idle = known ? Date.now() - Date.parse(known.lastUsedAt ?? known.at) : 0;
+  return { key, sessionId: known?.sessionId ?? null, rewarm: agent.provider === "claude" && idle > SEED_REWARM_MS };
+}
+function seedPrompt(runDir, state, call) {
+  const answer = {
+    review: `{"verdict": "CONTEXT_LOADED", "summary": "Context loaded for ${call.role.toUpperCase()}.", "findings": [], "checked": [<the files you read>]}`,
+    qa: `{"result": "CONTEXT_LOADED", "summary": "Context loaded for GENAU.", "items": []}`,
+  }[call.mode];
+  return [
+    readFileSync(join(SKILL_DIR, "roles", "flamme.md"), "utf8").trimEnd(),
+    "",
+    "---",
+    "",
+    "## This seed",
+    "",
+    `- Stage: ${call.stage}`,
+    `- Seed for: ${call.role} (${call.role.toUpperCase()}, the ${ROLE_TITLE[call.role]}). Perspective: ${CHECKS[call.role] ? "checker" : "worker"}.`,
+    `- Project root: ${ROOT}`,
+    `- Run directory: ${runDir}`,
+    `- Read:\n${SEED_INPUTS[call.role].map((f) => `  - ${join(runDir, f)}`).join("\n")}`,
+    ...(answer ? [`- This call answers in JSON; end with exactly: ${answer}`] : []),
+    "",
+  ].join("\n");
+}
+
 // ---------- units: one request built in parallel
 // units.md, DENKEN's optional split of the request into units that are built at the same time:
 //   - UNIT-1 (REQ-001, REQ-002) <title>. Scope: `src/a/`, `test/a/`.
@@ -573,7 +618,7 @@ function createUnits(runDir, state, units) {
     mkdirSync(join(run, "calls"), { recursive: true });
     if (!existsSync(join(root, ".denken", ".gitignore"))) writeFileSync(join(root, ".denken", ".gitignore"), "*\n");
     writeFileSync(join(run, REQUEST), unitRequest(runDir, u, units));
-    const child = { version: 1, task: `${state.task} · ${u.id}`, created: now(), log: logDir(state), verdicts: [], unit: u.id, title: u.title, mainRoot: ROOT, idBase: u.n * 100, scope: u.scope, ...runFields(state.assignment, base), levels: { ...state.levels, ...u.levels }, overrides: state.overrides ?? {} };
+    const child = { version: 1, task: `${state.task} · ${u.id}`, created: now(), log: logDir(state), verdicts: [], unit: u.id, title: u.title, mainRoot: ROOT, idBase: u.n * 100, scope: u.scope, ...runFields(state.assignment, base), levels: { ...state.levels, ...u.levels }, overrides: state.overrides ?? {}, seeding: state.seeding ?? [] };
     enterStage(child, "plan");
     logRequest(child, run);
     timeline(child, "DENKEN", `${u.id} (${u.reqs.join(", ")}) "${u.title}" starts in its own worktree; scope ${u.scope.join(", ")}`);
@@ -1230,6 +1275,7 @@ function renderFacts(facts) {
     ["Duration", facts.durationSec != null ? `${facts.durationSec}s` : null],
     ["Cost", facts.costUsd != null ? `$${facts.costUsd.toFixed(4)}` : null],
     ["Level", facts.level],
+    ["Seed", facts.seed],
     ["Model that ran", facts.modelRan],
     ["Tokens", facts.tokens ? `in ${facts.tokens.input ?? "?"} · out ${facts.tokens.output ?? "?"} · cache read ${facts.tokens.cacheRead ?? "?"}${facts.tokens.cacheWrite != null ? ` · cache write ${facts.tokens.cacheWrite}` : ""}` : null],
     ["HEAD", facts.head],
@@ -1445,14 +1491,17 @@ function launch(runDir, state) {
   for (const suffix of [".meta.json", ".pid", ".cli.pid", ".heartbeat", ".out.json", ".out.md", ".log"]) {
     if (existsSync(base + suffix)) renameSync(base + suffix, `${base}.prev-${stamp}${suffix}`);
   }
+  const seed = seedFor(runDir, state, call, agent);
   writeFileSync(`${base}.system.md`, system);
-  writeFileSync(`${base}.prompt.md`, prompt);
+  // A forked session keeps its seed's system prompt, so a seeded call's role goes in its message.
+  writeFileSync(`${base}.prompt.md`, seed ? `${system}\n---\n\n${prompt}- You start from the context FLAMME loaded for your role (above). Files may have changed since: read a file again before relying on it.${call.mode === "work" ? "" : " FLAMME's JSON at the end of it (CONTEXT_LOADED) only marked the context as loaded; it is not a result, and says nothing about the work."}\n` : prompt);
+  if (seed && !seed.sessionId) writeFileSync(`${base}.seed.prompt.md`, seedPrompt(runDir, state, call));
   const timeoutMs = Math.round(state.assignment.limits.callTimeoutMin * 60000);
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
   if (call.mode === "qa") mkdirSync(`${base}.evidence`, { recursive: true });
   // A unit's record lives in the parent's ai-log, outside the unit's worktree, where siblings
   // write too: the unit's guard covers its worktree, and Claude is denied the main checkout.
-  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
+  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, seed, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
   state.inflight = { ...call, provider: agent.provider, started: now() };
   timeline(state, `${call.role.toUpperCase()} (${agentLabel(agent)})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}`);
   state.calls.push({ id: call.id, mode: call.mode, provider: agent.provider, model: agent.model, attempt: call.attempt, started: state.inflight.started });
@@ -1462,6 +1511,8 @@ function launch(runDir, state) {
   child.unref();
 }
 
+// CONTEXT_LOADED is FLAMME's answer when it seeds a checker (the seed shares the call's schema);
+// from a real review or QA call it is not a result.
 function validOutput(mode, value) {
   if (mode === "review") {
     return ["APPROVED", "CHANGES_REQUESTED"].includes(value?.verdict) && Array.isArray(value.findings) &&
@@ -1498,9 +1549,9 @@ async function stopCallGroup(base, provider) {
   if (command.includes(provider)) await stopGroup(pgid);
 }
 
-async function runCli(provider, args, input, base, timeoutMs) {
+async function runCli(provider, args, input, base, timeoutMs, env = null) {
   const logFd = openSync(`${base}.log`, "w");
-  const child = spawn(provider, args, { cwd: ROOT, stdio: ["pipe", logFd, logFd], detached: true });
+  const child = spawn(provider, args, { cwd: ROOT, stdio: ["pipe", logFd, logFd], detached: true, ...(env ? { env: { ...process.env, ...env } } : {}) });
   closeSync(logFd);
   if (child.pid) writeFileSync(`${base}.cli.pid`, String(child.pid));
   child.stdin.on("error", () => {});
@@ -1519,6 +1570,53 @@ async function runCli(provider, args, input, base, timeoutMs) {
   return { ...result, timedOut };
 }
 
+// What a CLI run reported: its session, the final message (written to outPath), denials, errors,
+// and the facts of the run (model that ran, cost, tokens).
+function readRun(provider, logPath, structured, outPath) {
+  const run = { sessionId: null, denials: [], error: null, errorText: "", facts: {} };
+  const events = [];
+  for (const line of (existsSync(logPath) ? readFileSync(logPath, "utf8") : "").split("\n")) {
+    if (!line.startsWith("{")) {
+      if (line.trim()) run.errorText += `${line}\n`;
+      continue;
+    }
+    try {
+      events.push(JSON.parse(line));
+    } catch {}
+  }
+  if (provider === "claude") {
+    // The model that actually ran: an alias or an allowlist can differ from what was asked for.
+    const init = events.find((e) => e.type === "system" && e.subtype === "init");
+    run.facts.modelRan = init?.model ?? null;
+    run.sessionId = init?.session_id ?? null;
+    const final = events.findLast((e) => e.type === "result");
+    if (final) {
+      run.denials = (final.permission_denials ?? []).map((d) => ({ tool: d.tool_name, input: d.tool_input }));
+      if (final.is_error) {
+        run.error = `claude reported an error: ${final.subtype ?? ""} ${final.api_error_status ?? ""}`.trim();
+        run.errorText += `${final.result ?? ""} ${final.api_error_status ?? ""}\n`;
+      }
+      const output = structured ? final.structured_output : final.result;
+      if (output != null) writeFileSync(outPath, structured ? JSON.stringify(output, null, 2) : String(output));
+      run.facts.costUsd = final.total_cost_usd ?? null;
+      run.facts.tokens = final.usage ? { input: final.usage.input_tokens ?? null, output: final.usage.output_tokens ?? null, cacheRead: final.usage.cache_read_input_tokens ?? null, cacheWrite: final.usage.cache_creation_input_tokens ?? null } : null;
+      run.facts.turns = final.num_turns ?? null;
+    }
+  } else {
+    for (const event of events) {
+      if (event.type === "thread.started") run.sessionId = event.thread_id;
+      if (event.type === "error" || event.type === "turn.failed") run.errorText += `${JSON.stringify(event)}\n`;
+      if (event.type === "turn.completed" && event.usage) {
+        run.facts.tokens ??= { input: 0, output: 0, cacheRead: 0 };
+        run.facts.tokens.input += event.usage.input_tokens ?? 0;
+        run.facts.tokens.output += event.usage.output_tokens ?? 0;
+        run.facts.tokens.cacheRead += event.usage.cached_input_tokens ?? 0;
+      }
+    }
+  }
+  return run;
+}
+
 async function execCall(runDir, id) {
   const base = callBase(runDir, id);
   // A heartbeat lets `next` tell a live call from a dead one even if the pid is reused.
@@ -1534,64 +1632,123 @@ async function execCall(runDir, id) {
   const { provider, model, effort } = job.agent;
   // Claude gets the role as an appended system prompt, identical for every call of the role, so
   // calls share a cached prefix. Codex gets one message.
-  const prompt = provider === "claude" || !system ? message : `${system}\n---\n\n${message}`;
+  const prompt = job.seed || provider === "claude" || !system ? message : `${system}\n---\n\n${message}`;
   // Permissions DENKEN granted to this role on request widen the defaults, never a reviewer's.
   const grants = { network: false, domains: [], dirs: [], tools: [], ...job.agent.grants };
   const network = job.agent.network || grants.network;
   const meta = { status: "ok", nonce: job.nonce, exitCode: null, sessionId: null, denials: [], violations: [], error: null };
   const startedAt = Date.now();
   const facts = { provider, model: model ?? null, effort: effort ?? null, level: job.agent.level ?? null, cliVersion: (spawnSync(provider, ["--version"], { encoding: "utf8", timeout: 20000 }).stdout ?? "").trim().split("\n")[0] || null, head: gitText("rev-parse", "-q", "--verify", "HEAD") || null, stageBase: job.stageBase ?? null, grants: job.agent.grants ?? null };
-  let errorText = "";
 
-  // Both CLIs stream JSON events; they go straight to the log so `status` can show progress.
-  let args;
-  if (provider === "claude") {
-    meta.sessionId = randomUUID();
-    args = ["-p", "--output-format", "stream-json", "--verbose", "--session-id", meta.sessionId];
-    if (system) args.push("--append-system-prompt-file", `${base}.system.md`);
-    // Moving cwd and git status out of the system prompt lets calls in different directories (the
-    // units' worktrees) share it; within one directory it caches slightly worse, so it is kept to units.
-    if (system && job.protect) args.push("--exclude-dynamic-system-prompt-sections");
-    // Reviewers and GENAU check other agents' work, so they load no project settings (a worker
-    // could have planted hooks there) and no MCP servers.
-    if (job.mode !== "work") args.push("--setting-sources", "user", "--strict-mcp-config");
-    if (job.mode === "review") args.push("--tools", "Read,Grep,Glob", "--permission-mode", "dontAsk");
-    else {
-      const sandbox = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false };
-      args.push("--permission-mode", "auto");
-      if (!network) {
-        // The strict allowlist covers sandboxed commands only; web tools and MCP servers
-        // reach the network in-process, so they are removed too.
-        sandbox.network = { strictAllowlist: true, allowedDomains: grants.domains ?? [] };
-        args.push("--disallowedTools", "WebFetch,WebSearch");
-        if (job.mode === "work") args.push("--strict-mcp-config");
+  // Both CLIs stream JSON events; they go straight to the log so `status` can show progress. A call
+  // runs fresh, or as a fork of the seed FLAMME made for its role (job.seed): then its role text is
+  // in its message, and its flags are exactly the seed's, so the fork reads the seed from the cache.
+  const seed = job.seed ?? null;
+  const argsFor = ({ sessionId = null, forkOf = null, forSeed = false, out = outPath }) => {
+    if (provider === "claude") {
+      const args = ["-p", "--output-format", "stream-json", "--verbose", "--session-id", sessionId];
+      if (forkOf) args.push("--resume", forkOf, "--fork-session");
+      if (!seed && system) args.push("--append-system-prompt-file", `${base}.system.md`);
+      // Moving cwd and git status out of the system prompt keeps it the same across directories
+      // (units' worktrees) and for every fork of a seed.
+      if (seed || (system && job.protect)) args.push("--exclude-dynamic-system-prompt-sections");
+      // Reviewers and GENAU check other agents' work, so they load no project settings (a worker
+      // could have planted hooks there) and no MCP servers.
+      if (job.mode !== "work") args.push("--setting-sources", "user", "--strict-mcp-config");
+      // Hooks belong to someone's interactive sessions (summaries of their past work, notifications);
+      // in DENKEN's calls they would only add context the role must not rely on, and cost tokens.
+      if (job.mode === "review") args.push("--tools", "Read,Grep,Glob", "--permission-mode", "dontAsk", "--settings", JSON.stringify({ disableAllHooks: true }));
+      else {
+        const sandbox = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false };
+        args.push("--permission-mode", "auto");
+        if (!network) {
+          // The strict allowlist covers sandboxed commands only; web tools and MCP servers
+          // reach the network in-process, so they are removed too.
+          sandbox.network = { strictAllowlist: true, allowedDomains: grants.domains ?? [] };
+          args.push("--disallowedTools", "WebFetch,WebSearch");
+          if (job.mode === "work") args.push("--strict-mcp-config");
+        }
+        // The sandbox bounds Bash; Claude's own file tools are bounded by permission rules. A unit's
+        // agents may not edit the main checkout, which holds the other units' record.
+        // "//" makes the rule path absolute; a single "/" would be relative to the settings source.
+        const permissions = job.protect ? { deny: ["Edit", "Write", "NotebookEdit"].map((tool) => `${tool}(/${job.protect}/**)`) } : undefined;
+        args.push("--settings", JSON.stringify({ disableAllHooks: true, sandbox, ...(permissions ? { permissions } : {}) }));
+        for (const dir of grants.dirs) args.push("--add-dir", dir);
+        if (grants.tools.length) args.push("--allowedTools", grants.tools.join(","));
       }
-      // The sandbox bounds Bash; Claude's own file tools are bounded by permission rules. A unit's
-      // agents may not edit the main checkout, which holds the other units' record.
-      // "//" makes the rule path absolute; a single "/" would be relative to the settings source.
-      const permissions = job.protect ? { deny: ["Edit", "Write", "NotebookEdit"].map((tool) => `${tool}(/${job.protect}/**)`) } : undefined;
-      args.push("--settings", JSON.stringify({ sandbox, ...(permissions ? { permissions } : {}) }));
-      for (const dir of grants.dirs) args.push("--add-dir", dir);
-      if (grants.tools.length) args.push("--allowedTools", grants.tools.join(","));
+      if (structured) args.push("--json-schema", readFileSync(schemaPath, "utf8"));
+      if (model) args.push("--model", model);
+      if (effort) args.push("--effort", effort);
+      return args;
     }
-    if (structured) args.push("--json-schema", readFileSync(schemaPath, "utf8"));
-    if (model) args.push("--model", model);
-    if (effort) args.push("--effort", effort);
-  } else {
-    args = ["exec", "--json", "-s", job.mode === "review" ? "read-only" : "workspace-write", "-o", outPath];
-    if (network && job.mode !== "review") args.push("-c", "sandbox_workspace_write.network_access=true");
-    if (job.mode !== "review") for (const dir of grants.dirs) args.push("--add-dir", dir);
-    if (structured) args.push("--output-schema", schemaPath);
+    // A Codex seed only reads. A fork takes its sandbox from -c, and would otherwise keep the
+    // seed's, so every fork sets it.
+    const mode = forSeed || job.mode === "review" ? "read-only" : "workspace-write";
+    const args = forkOf ? ["exec", "fork", forkOf, "--json", "-c", `sandbox_mode="${mode}"`, "-o", out] : ["exec", "--json", "-s", mode, "-o", out];
+    if (!forSeed && network && job.mode !== "review") args.push("-c", "sandbox_workspace_write.network_access=true");
+    if (!forSeed && job.mode !== "review" && grants.dirs.length) {
+      if (forkOf) args.push("-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(grants.dirs)}`);
+      else for (const dir of grants.dirs) args.push("--add-dir", dir);
+    }
+    if (structured && !forSeed) args.push("--output-schema", schemaPath);
     if (model) args.push("-m", model);
     if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
     args.push("-");
-  }
+    return args;
+  };
 
   const gitFiles = ["config", "info/exclude"].map((f) => resolve(ROOT, gitText("rev-parse", "--git-path", f)));
   const gitPinned = Object.fromEntries(gitFiles.map((f) => [f, existsSync(f) ? readFileSync(f) : null]));
   const before = snapshot(runDir, id, job.log);
   const pinned = pinOwned(before.owned);
-  const result = await runCli(provider, args, prompt, base, job.timeoutMs);
+
+  // FLAMME reads the role's context into a seed session, once; this call and the role's later calls
+  // in the stage fork it. The seed only reads: a seed that changed anything is a violation.
+  let forkOf = seed?.sessionId ?? null;
+  meta.seed = seed ? { key: seed.key, sessionId: forkOf, created: false, rewarmed: false, fallback: null, facts: null } : null;
+  // A seed's forks come minutes apart (rounds, the user's confirmation): the seed's prefix is written
+  // to the cache for an hour rather than the default five minutes on API billing. Only the seed and
+  // its re-warm write that way; a fork's own writes keep the default, cheaper rate.
+  const cacheEnv = seed && provider === "claude" ? { CLAUDE_CODE_PROMPT_CACHE_TTL: "1h" } : null;
+  // A seed idle for close to that hour is re-warmed: forked once with nothing to do, and that
+  // session becomes the seed. Forks of a stale seed would each pay for the whole prefix again.
+  if (seed?.rewarm && forkOf) {
+    const warmId = randomUUID();
+    const nothing = structured ? `Nothing to do yet. Answer exactly: ${job.mode === "review" ? '{"verdict": "CONTEXT_LOADED", "summary": "Context kept warm.", "findings": [], "checked": []}' : '{"result": "CONTEXT_LOADED", "summary": "Context kept warm.", "items": []}'}` : "Nothing to do yet. Answer exactly: READY";
+    const r = await runCli(provider, argsFor({ sessionId: warmId, forkOf, out: `${base}.rewarm.out` }), nothing, `${base}.rewarm`, job.timeoutMs, cacheEnv);
+    if (r.status === 0 && !r.timedOut) Object.assign(meta.seed, { sessionId: warmId, rewarmed: true });
+    forkOf = meta.seed.sessionId;
+  }
+  if (seed && !forkOf) {
+    const seedSession = provider === "claude" ? randomUUID() : null;
+    const seedStarted = Date.now();
+    const r = await runCli(provider, argsFor({ sessionId: seedSession, forSeed: true, out: `${base}.seed.out.md` }), readFileSync(`${base}.seed.prompt.md`, "utf8"), `${base}.seed`, job.timeoutMs, cacheEnv);
+    const run = readRun(provider, `${base}.seed.log`, structured, `${base}.seed.out.md`);
+    const changed = violations(before, snapshot(runDir, id, job.log), { frozen: true, ignored: "all", allow: [] }, runDir, pinned, id);
+    if (changed.length) {
+      Object.assign(meta, { status: "guard_violation", violations: changed.map((v) => `FLAMME's seed: ${v}`), finished: now() });
+      meta.facts = { ...facts, durationSec: Math.round((Date.now() - startedAt) / 1000) };
+      clearInterval(heartbeat);
+      return writeMeta(base, meta);
+    }
+    const seedId = provider === "claude" ? seedSession : run.sessionId;
+    meta.seed.facts = { ...run.facts, durationSec: Math.round((Date.now() - seedStarted) / 1000) };
+    if (r.status === 0 && !r.timedOut && !run.error && seedId) Object.assign(meta.seed, { sessionId: seedId, created: true });
+    else meta.seed.fallback = `FLAMME could not make the seed: ${oneLine(run.error ?? run.errorText ?? `exit ${r.status}`, 200)}`;
+    forkOf = meta.seed.sessionId;
+  }
+
+  if (provider === "claude") meta.sessionId = randomUUID();
+  let result = await runCli(provider, argsFor({ sessionId: meta.sessionId, forkOf }), prompt, base, job.timeoutMs);
+  let run = readRun(provider, `${base}.log`, structured, outPath);
+  // A fork that could not start (its seed gone, say) runs once more from scratch.
+  if (forkOf && !result.timedOut && result.status !== 0 && !existsSync(outPath)) {
+    meta.seed.fallback = `the fork of ${forkOf} failed: ${oneLine(run.error ?? run.errorText, 200)}`;
+    renameSync(`${base}.log`, `${base}.fork-failed.log`);
+    if (provider === "claude") meta.sessionId = randomUUID();
+    result = await runCli(provider, argsFor({ sessionId: meta.sessionId }), prompt, base, job.timeoutMs);
+    run = readRun(provider, `${base}.log`, structured, outPath);
+  }
   // Git's own config could make the engine's next git command run a program (fsmonitor, filters),
   // and info/exclude could hide new files from the guard. Undo any change before using git again.
   const gitViolations = [];
@@ -1608,45 +1765,12 @@ async function execCall(runDir, id) {
       gitViolations.push(`git file changed: ${relative(ROOT, f)} (restored)`);
     }
   }
-
-  const events = [];
-  for (const line of readFileSync(`${base}.log`, "utf8").split("\n")) {
-    if (!line.startsWith("{")) {
-      if (line.trim()) errorText += `${line}\n`;
-      continue;
-    }
-    try {
-      events.push(JSON.parse(line));
-    } catch {}
-  }
-  if (provider === "claude") {
-    // The model that actually ran: an alias or an allowlist can differ from what was asked for.
-    facts.modelRan = events.find((e) => e.type === "system" && e.subtype === "init")?.model ?? null;
-    const final = events.findLast((e) => e.type === "result");
-    if (final) {
-      meta.denials = (final.permission_denials ?? []).map((d) => ({ tool: d.tool_name, input: d.tool_input }));
-      if (final.is_error) {
-        meta.error = `claude reported an error: ${final.subtype ?? ""} ${final.api_error_status ?? ""}`.trim();
-        errorText += `${final.result ?? ""} ${final.api_error_status ?? ""}\n`;
-      }
-      const output = structured ? final.structured_output : final.result;
-      if (output != null) writeFileSync(outPath, structured ? JSON.stringify(output, null, 2) : String(output));
-      facts.costUsd = final.total_cost_usd ?? null;
-      facts.tokens = final.usage ? { input: final.usage.input_tokens ?? null, output: final.usage.output_tokens ?? null, cacheRead: final.usage.cache_read_input_tokens ?? null, cacheWrite: final.usage.cache_creation_input_tokens ?? null } : null;
-      facts.turns = final.num_turns ?? null;
-    }
-  } else {
-    for (const event of events) {
-      if (event.type === "thread.started") meta.sessionId = event.thread_id;
-      if (event.type === "error" || event.type === "turn.failed") errorText += `${JSON.stringify(event)}\n`;
-      if (event.type === "turn.completed" && event.usage) {
-        facts.tokens ??= { input: 0, output: 0, cacheRead: 0 };
-        facts.tokens.input += event.usage.input_tokens ?? 0;
-        facts.tokens.output += event.usage.output_tokens ?? 0;
-        facts.tokens.cacheRead += event.usage.cached_input_tokens ?? 0;
-      }
-    }
-  }
+  if (provider === "codex") meta.sessionId = run.sessionId;
+  meta.denials = run.denials;
+  if (run.error) meta.error = run.error;
+  const errorText = run.errorText;
+  Object.assign(facts, run.facts);
+  if (meta.seed) facts.seed = meta.seed.fallback ? `not used: ${meta.seed.fallback}` : `forked from FLAMME's seed ${meta.seed.sessionId}${meta.seed.created ? ", made for this call" : ""}`;
   meta.exitCode = result.status;
   if (result.timedOut) meta.error = `timed out after ${Math.round(job.timeoutMs / 60000)} min`;
   else if (result.error) meta.error = result.error.message;
@@ -1788,6 +1912,22 @@ function ingest(runDir, state, meta) {
   const base = callBase(runDir, call.id);
   const who = call.role.toUpperCase();
   logRaw(state, runDir, call.id);
+  // FLAMME's seed for the role, made by this call or used by it.
+  if (meta.seed) {
+    const t = meta.seed.facts?.tokens;
+    if (!meta.seed.fallback && meta.seed.sessionId) {
+      const known = (state.seedSessions ??= {})[meta.seed.key];
+      state.seedSessions[meta.seed.key] = { ...(known ?? { role: call.role, stage: call.stage, provider: call.provider, call: call.id, at: now() }), sessionId: meta.seed.sessionId, lastUsedAt: now() };
+      if (meta.seed.rewarmed) timeline(state, `FLAMME (${call.provider})`, `re-warmed ${who}'s seed, idle for close to an hour, before ${call.id} forked it`);
+    }
+    if (meta.seed.created && !meta.seed.fallback) {
+      timeline(state, `FLAMME (${call.provider})`, `seeded ${who}'s context for the ${call.stage} stage${t ? ` (in ${t.input ?? "?"} · cache read ${t.cacheRead ?? "?"} · out ${t.output ?? "?"})` : ""}; ${who}'s calls fork it`);
+    }
+    if (meta.seed.fallback) {
+      delete state.seedSessions?.[meta.seed.key];
+      timeline(state, "ENGINE", `${who} ran without FLAMME's seed: ${oneLine(meta.seed.fallback, 200)}`);
+    }
+  }
   if (meta.status !== "ok") timeline(state, who, `${meta.status}${meta.error ? `: ${oneLine(meta.error)}` : ""}${meta.violations?.length ? `: ${meta.violations.join("; ")}` : ""}`);
 
   if (meta.status === "guard_violation") return block(state, "user", { reason: "guard_violation", resolveWith: "retry", call: call.id, violations: meta.violations });
@@ -2377,6 +2517,11 @@ function cmdStart(runDir, args = []) {
   if (split?.problems.length) fail(`${UNITS}: ${split.problems.join("; ")}`);
   Object.assign(state, runFields({ crossProvider: config.crossProvider, sameReviewer: config.sameReviewer, allowSameReviewer: config.allowSameReviewer, stages: config.stages, limits: config.limits, levels: config.levels, warnings: config.warnings }, gitText("rev-parse", "-q", "--verify", "HEAD") || null));
   Object.assign(state, parseChoices(args));
+  // DENKEN can turn seeds off for a small task (start --seeds off), or name the providers to seed.
+  const seedsAt = args.indexOf("--seeds");
+  const seedsArg = seedsAt >= 0 ? String(args[seedsAt + 1] ?? "") : null;
+  if (seedsArg !== null && seedsArg !== "off" && !seedsArg.split(",").every((p) => ["claude", "codex"].includes(p))) fail("--seeds takes off, or the providers to seed: claude, codex, or claude,codex");
+  state.seeding = seedsArg === null ? Object.keys(config.seeds ?? {}).filter((p) => config.seeds[p]) : seedsArg === "off" ? [] : seedsArg.split(",");
   // The levels DENKEN picked apply to every unit too, unless the unit's own line changes them.
   for (const u of split?.units ?? []) {
     const trial = { ...state, levels: { ...state.levels, ...u.levels } };
@@ -2451,6 +2596,8 @@ function cmdRule(runDir, args) {
   if (decision === "abort") state.stage = "aborted";
   else if (decision === "replan") {
     for (const s of ["plan", "dev", "qa", "wiki"]) state.approved[s] = null;
+    // A new plan starts from new seeds.
+    state.seedEpoch = (state.seedEpoch ?? 0) + 1;
     state.devInput = null;
     state.confirmed = null;
     enterStage(state, "plan");
@@ -2778,6 +2925,13 @@ function tokenReport(runDir, s) {
       meta = JSON.parse(readFileSync(`${callBase(runDir, c.id)}.meta.json`, "utf8"));
     } catch {
       continue;
+    }
+    const seedTokens = meta.seed?.facts?.tokens;
+    if (seedTokens) {
+      const f = (byRole.flamme ??= { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
+      f.calls++;
+      for (const k of ["input", "output", "cacheRead", "cacheWrite"]) f[k] += seedTokens[k] ?? 0;
+      f.costUsd += meta.seed.facts.costUsd ?? 0;
     }
     const t = meta.facts?.tokens;
     if (!t) continue;

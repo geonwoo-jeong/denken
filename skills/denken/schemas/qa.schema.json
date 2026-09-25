@@ -3,7 +3,7 @@
   "additionalProperties": false,
   "required": ["result", "summary", "items"],
   "properties": {
-    "result": { "type": "string", "enum": ["PASS", "FAIL"] },
+    "result": { "type": "string", "enum": ["PASS", "FAIL", "CONTEXT_LOADED"] },
     "summary": { "type": "string" },
     "items": {
       "type": "array",

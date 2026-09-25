@@ -3,7 +3,7 @@
   "additionalProperties": false,
   "required": ["verdict", "summary", "findings", "checked"],
   "properties": {
-    "verdict": { "type": "string", "enum": ["APPROVED", "CHANGES_REQUESTED"] },
+    "verdict": { "type": "string", "enum": ["APPROVED", "CHANGES_REQUESTED", "CONTEXT_LOADED"] },
     "summary": { "type": "string" },
     "findings": {
       "type": "array",

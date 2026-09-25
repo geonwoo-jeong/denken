@@ -17,6 +17,8 @@
 //       providers           comma-separated list of providers DENKEN may use
 //       allowSameReviewer   true lets the same provider, model and effort check its own work
 //       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits
+//       seeds.<provider>      true | false: FLAMME seeds each role's context once per stage and
+//                           every call forks from it (default: claude true, codex false)
 //       levels.<provider>.<light|heavy>.<model|effort>
 //                           what a level DENKEN picks for a stage means on each provider;
 //                           "standard" is always the role's own model and effort
@@ -40,6 +42,10 @@ export const DEFAULT_LIMITS = { topicRepeats: 3, roundsPerStage: 5, callTimeoutM
 export const LEVELS = ["light", "standard", "heavy"];
 // Heavy stops at "high": "max" tends to overthink. Which values a model accepts depends on it.
 export const EFFORTS = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high", "xhigh", "max", "ultra"] };
+// FLAMME's seeds pay off where forks share the seed's cached prefix. Claude's cache is keyed by
+// content, so a fork reads the seed from it; Codex keys its cache by session, so a fork re-reads
+// the whole seed uncached, and seeding costs more than it saves.
+export const DEFAULT_SEEDS = { claude: true, codex: false };
 export const DEFAULT_LEVELS = {
   claude: { light: { model: "sonnet", effort: "low" }, heavy: { model: "opus", effort: "high" } },
   codex: { light: { effort: "low" }, heavy: { effort: "high" } },
@@ -156,6 +162,12 @@ export function resolveConfig(root = process.cwd()) {
     else if (key === "callTimeoutMin" ? !(value > 0) : !Number.isInteger(value) || value < 1) errors.push(`limits.${key} must be a positive ${key === "callTimeoutMin" ? "number" : "integer"}`);
   }
   const allowSameReviewer = layers.reduce((acc, l) => l?.allowSameReviewer ?? acc, false) === true;
+  const seeds = { ...DEFAULT_SEEDS };
+  for (const l of layers) Object.assign(seeds, l?.seeds);
+  for (const [provider, on] of Object.entries(seeds)) {
+    if (!SUPPORTED.includes(provider)) errors.push(`seeds.${provider}: unsupported provider`);
+    else if (typeof on !== "boolean") errors.push(`seeds.${provider} must be true or false`);
+  }
   const levels = JSON.parse(JSON.stringify(DEFAULT_LEVELS));
   for (const l of layers) {
     for (const [provider, byLevel] of Object.entries(l?.levels ?? {})) {
@@ -226,7 +238,7 @@ export function resolveConfig(root = process.cwd()) {
     warnings.push(`the same model checks its own work in ${sameReviewer.join(", ")}; runs will not start until you give the reviewer (${sameReviewer.map((st) => (st === "qa" ? "genau" : REVIEWER[st])).join(", ")}) a different model or effort, or set allowSameReviewer true`);
   }
 
-  return { errors, warnings, status, usable, crossProvider, sameReviewer, allowSameReviewer, sources, stages, limits, levels };
+  return { errors, warnings, status, usable, crossProvider, sameReviewer, allowSameReviewer, sources, stages, limits, levels, seeds };
 }
 
 // ---------- CLI
@@ -257,6 +269,7 @@ function show(json) {
       if (stage === "dev") row("qa", "", `GENAU → ${describe(r.stages.qa.runner)}`);
     }
     const level = (spec) => [spec.model, spec.effort && `effort ${spec.effort}`].filter(Boolean).join(", ") || "as configured";
+    console.log(`\nSeeds:     FLAMME seeds each role's context once per stage for ${SUPPORTED.filter((p) => r.seeds[p]).join(" and ") || "no provider"}`);
     console.log(`\nLevels DENKEN picks per stage by difficulty (standard = each role as configured above):`);
     for (const provider of SUPPORTED) console.log(`  ${provider.padEnd(7)} light: ${level(r.levels[provider].light)} · heavy: ${level(r.levels[provider].heavy)}`);
   }
@@ -275,6 +288,10 @@ function locate(config, key, create) {
   const parts = key.split(".");
   const [head, a] = parts;
   if ((head === "providers" || head === "allowSameReviewer") && parts.length === 1) return [config, head];
+  if (head === "seeds" && parts.length === 2 && SUPPORTED.includes(a)) {
+    if (create) config.seeds ??= {};
+    return [config.seeds ?? {}, a];
+  }
   if (head === "levels" && parts.length === 4 && SUPPORTED.includes(a) && ["light", "heavy"].includes(parts[2]) && ["model", "effort"].includes(parts[3])) {
     const levels = create ? (config.levels ??= {}) : config.levels ?? {};
     const byProvider = create ? (levels[a] ??= {}) : levels[a] ?? {};
@@ -317,7 +334,7 @@ function main() {
   const paths = configPaths();
   const target = args.includes("--global") ? paths.global : args.includes("--local") ? paths.local : paths.shared;
   const [command, key, value] = args.filter((a) => !a.startsWith("--"));
-  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits, levels.<claude|codex>.<light|heavy>.<model|effort>`;
+  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits, levels.<claude|codex>.<light|heavy>.<model|effort>, seeds.<claude|codex>`;
 
   if (!command) return show(args.includes("--json"));
   if (command === "init") {
@@ -335,7 +352,7 @@ function main() {
       const slot = locate(config, key, true);
       if (!slot) fail(`unknown key "${key}". ${keyHelp}`);
       const [obj, field] = slot;
-      if (field === "network" || field === "allowSameReviewer") {
+      if (field === "network" || field === "allowSameReviewer" || key.startsWith("seeds.")) {
         if (!["true", "false"].includes(value)) fail(`${key} must be true or false`);
         obj[field] = value === "true";
       } else obj[field] = key === "providers" ? value.split(",").map((s) => s.trim()).filter(Boolean) : key.startsWith("limits.") ? Number(value) : value;

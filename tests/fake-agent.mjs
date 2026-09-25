@@ -55,19 +55,32 @@ if (args[0] === "--version") {
 const system = args.includes("--append-system-prompt-file") ? readFileSync(args[args.indexOf("--append-system-prompt-file") + 1], "utf8") : "";
 const prompt = `${system}\n${readFileSync(0, "utf8")}`;
 const scenarioPath = process.env.FAKE_SCENARIO;
+// A re-warm of a seed: a fork with nothing to do.
+if (!/^# \w+:/m.test(prompt)) {
+  appendFileSync(`${scenarioPath}.log`, `${cli} rewarm\n`);
+  appendFileSync(`${scenarioPath}.args.jsonl`, `${JSON.stringify({ key: "rewarm", attempt: 1, args })}\n`);
+  const sessionId = args[args.indexOf("--session-id") + 1];
+  const structured = prompt.match(/Answer exactly: (\{.*\})/)?.[1];
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "fake-resolved" }));
+  console.log(JSON.stringify({ type: "result", is_error: false, result: structured ?? "READY", structured_output: structured ? JSON.parse(structured) : null, session_id: sessionId, permission_denials: [] }));
+  process.exit(0);
+}
 const scenario = JSON.parse(readFileSync(scenarioPath, "utf8"));
 
 const role = prompt.match(/^# (\w+):/m)[1].toLowerCase();
-const [, stage, round] = prompt.match(/- Stage: (\w+), round (\d+)/);
+// FLAMME's seed calls name the stage and the role they seed, not a round.
+const [, stage, round = "0"] = prompt.match(/- Stage: (\w+)(?:, round (\d+))?/);
+const seedFor = prompt.match(/^- Seed for: (\w+)/m)?.[1] ?? null;
 const runDir = prompt.match(/- Run directory: (.+)/)[1];
 const unit = prompt.match(/^- Unit: (UNIT-\d+)/m)?.[1] ?? null;
-const callId = `${stage}-${role}-${round}`;
+const callId = seedFor ? `${stage}-flamme-${seedFor}` : `${stage}-${role}-${round}`;
 const key = `${unit ? `${unit}:` : ""}${callId}`;
 // In a unit, the file STARK works on: <first scope folder>/work.txt, or the first scope file.
 const request = existsSync(join(runDir, "request.md")) ? readFileSync(join(runDir, "request.md"), "utf8") : "";
 const scopeFirst = request.match(/^- Scope: `([^`]+)`/m)?.[1];
 const devFile = unit ? (scopeFirst.endsWith("/") ? `${scopeFirst}work.txt` : scopeFirst) : "src.txt";
-const readOnly = args.includes("read-only") || args.includes("dontAsk");
+// A Codex fork sets its sandbox with -c sandbox_mode="...".
+const readOnly = args.includes("read-only") || args.includes('sandbox_mode="read-only"') || args.includes("dontAsk");
 const network = readOnly
   ? "-"
   : cli === "codex"
@@ -105,7 +118,11 @@ if (step.fail) {
 }
 
 let final;
-if (step.requestPermission) {
+if (role === "flamme") {
+  // A seed: read, then answer as the call it seeds must (JSON when a schema is attached).
+  const schema = args.includes("--json-schema") ? args[args.indexOf("--json-schema") + 1] : args.includes("--output-schema") ? readFileSync(args[args.indexOf("--output-schema") + 1], "utf8") : null;
+  final = !schema ? `brief for ${seedFor}` : schema.includes('"findings"') ? { verdict: "CONTEXT_LOADED", summary: `Context loaded for ${seedFor}.`, findings: [], checked: ["fake seed"] } : { result: "CONTEXT_LOADED", summary: "Context loaded.", items: [] };
+} else if (step.requestPermission) {
   // Ask DENKEN for a permission through the engine, then stop, as the role files say.
   const [, script] = prompt.match(/node "([^"]+)" request-permission "/);
   spawnSync(process.execPath, [script, "request-permission", runDir, "--need", step.requestPermission.need, "--why", step.requestPermission.why], { stdio: "ignore" });
