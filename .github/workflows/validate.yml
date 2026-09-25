@@ -8,10 +8,17 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The scripts are TypeScript that Node runs directly: 22.18 is the first release that strips types by default.
+        node-version: ["22.18", "24"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
       - run: npm run validate
       - run: npm test

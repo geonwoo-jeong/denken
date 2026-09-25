@@ -5,11 +5,19 @@
   "description": "A collection of Agent Skills, installable with npx skills",
   "type": "module",
   "scripts": {
-    "new": "node scripts/new-skill.mjs",
-    "validate": "node scripts/validate.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "new": "node scripts/new-skill.ts",
+    "validate": "node scripts/validate.ts",
+    "lint": "oxlint --type-aware --deny-warnings",
+    "typecheck": "tsc -p .",
+    "test": "node --test tests/*.test.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "oxlint": "^1.85.0",
+    "oxlint-tsgolint": "^7.0.2003",
+    "typescript": "^7.0.2"
   }
 }

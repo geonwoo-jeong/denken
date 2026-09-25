@@ -68,10 +68,10 @@ Without `units.md`, the request runs as one, as usual.
 When a unit needs you, `next` returns its action with `unit` set (for example `needs_ruling` for UNIT-2). Answer it on the run with `--unit`:
 
 ```bash
-node <skill-dir>/scripts/denken.mjs rule <run> --unit UNIT-2 --decision dismiss --note "..."
-node <skill-dir>/scripts/denken.mjs grant <run> --unit UNIT-1 --dir <path> --note "..."
-node <skill-dir>/scripts/denken.mjs retry <run> --unit UNIT-1
-node <skill-dir>/scripts/denken.mjs status <run> --unit UNIT-1
+node <skill-dir>/scripts/denken.ts rule <run> --unit UNIT-2 --decision dismiss --note "..."
+node <skill-dir>/scripts/denken.ts grant <run> --unit UNIT-1 --dir <path> --note "..."
+node <skill-dir>/scripts/denken.ts retry <run> --unit UNIT-1
+node <skill-dir>/scripts/denken.ts status <run> --unit UNIT-1
 ```
 
 The other units keep working while you decide, but only while `next` runs, so run `next` again once you have answered.

@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // Every stable category is an error, with each rule's default options. A rule is turned off only
+  // when no code can satisfy it together with another enabled rule (or only by dodging one of
+  // them), and the reason is written next to it.
+  "plugins": ["eslint", "typescript", "unicorn", "oxc", "import", "node", "promise"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "pedantic": "error",
+    "perf": "error",
+    "style": "error",
+    "restriction": "error"
+  },
+  "rules": {
+    // With import/no-default-export on, a module could export nothing at all.
+    "import/no-named-export": "off",
+    // A module with one export must then default-export it, which import/no-default-export forbids.
+    "import/prefer-default-export": "off",
+    // typescript/promise-function-async requires `async` on every function that returns a promise,
+    // promise/prefer-await-to-callbacks forbids callbacks and node/no-sync forbids blocking I/O:
+    // with async forbidden too, no file could be read.
+    "oxc/no-async-await": "off",
+    // unicorn/prefer-top-level-await flags main(), main().catch() and async IIFEs at the top level,
+    // and typescript/no-floating-promises with eslint/no-void flags the rest: an ES module could
+    // not start async work at all.
+    "node/no-top-level-await": "off",
+    // one-var puts a scope's declarations in one statement and no-use-before-define orders them by
+    // dependency; sort-vars would also order them alphabetically, which only renaming satisfies.
+    "eslint/sort-vars": "off",
+    // Not a contradiction between two rules: this one contradicts the product, a Node CLI that runs
+    // git and the agent CLIs and keeps its record in files. The only form it accepts,
+    // process.getBuiltinModule, loads the same modules out of its sight. Turned off at the user's word.
+    "import/no-nodejs-modules": "off"
+  },
+  "ignorePatterns": ["node_modules", ".agents", ".claude"]
+}

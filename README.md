@@ -52,7 +52,7 @@ units   optional: independent parts of a request run plan, dev and qa in paralle
 
 How it works:
 
-- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent writes the request with you, rules on disputes and reports back.
+- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.ts`). The DENKEN agent writes the request with you, rules on disputes and reports back.
 - **Read-only review:** reviewers are read-only. Claude gets only Read, Grep and Glob; Codex runs in its read-only sandbox. A review that changes a file is rejected.
 - **Approval gate:** a stage moves on only after its review has no blocking findings. The engine also checks that the TODO lists cover every confirmed item and nothing out of scope or deferred, and development waits for you to confirm them.
 - **TODO lists:** only METHODE words the items, and only STARK ticks development items. No tick without evidence: STARK ticks an item through the engine, which runs its tests, checks that the evidence names a file changed for the item, and writes the tick and evidence into the list:
@@ -73,24 +73,26 @@ How it works:
 
 ### Choosing which AI plays each role
 
-Requires the [Claude Code](https://code.claude.com) and/or [Codex](https://developers.openai.com/codex) CLI, installed and logged in. The first time DENKEN runs in a project, it proposes an assignment and asks you to confirm it. You can change it at any time, either by asking DENKEN ("configure denken") or directly:
+Requires Node.js 22.18 or later, git, and the [Claude Code](https://code.claude.com) and/or [Codex](https://developers.openai.com/codex) CLI, installed and logged in. The first time DENKEN runs in a project, it proposes an assignment and asks you to confirm it. You can change it at any time, either by asking DENKEN ("configure denken") or directly:
 
 ```bash
 S=.claude/skills/denken/scripts        # or wherever the skill was installed, e.g. .agents/skills/denken
-node $S/config.mjs                     # show the assignment and provider status
-node $S/config.mjs set stark claude    # Claude develops; its reviewer and QA switch to Codex
-node $S/config.mjs set stark.model <model> --local
+node $S/config.ts                     # show the assignment and provider status
+node $S/config.ts set stark claude    # Claude develops; its reviewer and QA switch to Codex
+node $S/config.ts set stark.model <model> --local
 ```
 
 `.denken/config.json` is shared with your team. `.denken/config.local.json` (`--local`) and `~/.config/denken/config.json` (`--global`) hold personal overrides.
 
 ## Development
 
-Requires Node.js 20 or later. There are no dependencies to install.
+Requires Node.js 22.18 or later: the scripts are TypeScript, which Node runs directly. The skill needs no dependencies; `npm install` brings the linter and TypeScript for development.
 
 ```bash
 npm run new -- my-skill                                  # scaffold skills/my-skill/SKILL.md
 npm run validate                                         # check every skill
+npm run lint                                             # oxlint, every stable rule category, type-aware
+npm run typecheck                                        # TypeScript, strictest settings
 npm test                                                 # run-engine tests (fake agent CLIs, no API calls)
 npx skills add . --list                                  # confirm the CLI discovers it
 npx skills use ./ --skill my-skill --agent claude-code   # try it without installing
