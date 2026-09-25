@@ -5,18 +5,21 @@
  */
 import { DENKEN_DIR, EXCLUDE, ROOT, SKILL_DIR } from "./paths.ts";
 import { entriesOf, mapAsync, unique } from "./lists.ts";
-import { exists, hashFile } from "./files.ts";
+import { exists, hashFile, isFolder } from "./files.ts";
 import { linkTarget, listPaths } from "./files-tree.ts";
 import { sha, shaBinary } from "./text.ts";
 import type { Snapshot } from "./types-work.ts";
 import type { Tree } from "./types-names.ts";
-import { gitBinary } from "./git.ts";
+import { gitGuardBinary } from "./git.ts";
 import path from "node:path";
 import { toLine } from "./json.ts";
 
 type Entry = readonly [string, string];
 
-const AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor", ".gemini"],
+const UNREADABLE_FOLDER = "unreadable-folder",
+  // A symlink's mark starts with this.
+  SYMLINK = "symlink:",
+  AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor", ".gemini"],
   CONFIG_FILES: readonly string[] = ["config.json", "config.local.json"],
   CONTEXT_FILE = /(?:^|\/)(?:CLAUDE|CLAUDE\.local|AGENTS)\.md$/u,
   // The record's raw exchanges and QA evidence, written by the engine alone after each call.
@@ -24,7 +27,7 @@ const AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor"
   utf8Of = (bytes: string): string => Buffer.from(bytes, "latin1").toString("utf8"),
   // A git listing separated by NUL bytes (-z), as raw names (latin1) or as paths (utf8).
   rawNames = async (args: readonly string[]): Promise<readonly string[]> => {
-    const bytes = await gitBinary(args);
+    const bytes = await gitGuardBinary(args);
     return bytes.split("\0").filter(Boolean);
   },
   gitNames = async (args: readonly string[]): Promise<readonly string[]> => {
@@ -55,10 +58,10 @@ const AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor"
   // The project's tracked and untracked state, as one hash.
   projectHash = async (): Promise<string> => {
     const untracked = await rawNames(["ls-files", "--others", "--exclude-standard", "-z", "--", ".", ...EXCLUDE]),
-      head = await gitBinary(["rev-parse", "-q", "--verify", "HEAD"]),
-      status = await gitBinary(["status", "--porcelain=v1", "--untracked-files=all", "--", ".", ...EXCLUDE]),
-      diff = await gitBinary(["diff", "--binary", "--", ".", ...EXCLUDE]),
-      staged = await gitBinary(["diff", "--cached", "--binary", "--", ".", ...EXCLUDE]),
+      head = await gitGuardBinary(["rev-parse", "-q", "--verify", "HEAD"]),
+      status = await gitGuardBinary(["status", "--porcelain=v1", "--untracked-files=all", "--", ".", ...EXCLUDE]),
+      diff = await gitGuardBinary(["diff", "--binary", "--", ".", ...EXCLUDE]),
+      staged = await gitGuardBinary(["diff", "--cached", "--binary", "--", ".", ...EXCLUDE]),
       lines = await mapAsync(untracked, untrackedLine);
     return shaBinary([head, status, diff, staged, ...lines].join(""));
   },
@@ -94,12 +97,19 @@ const AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor"
       agents = await agentConfigFiles();
     return [...config.flat(), ...runFiles.filter((file) => !path.relative(runDir, file).startsWith(`calls/${callId}.`)), ...record, ...agents];
   },
-  // A file's mark: its content's hash, and for a symlink also where it points.
+  /*
+   * A path's mark: a file's content hash; for a symlink, also where it points; a folder in a
+   * listing is one that could not be read.
+   */
   ownedEntry = async (file: string): Promise<Entry> => {
     const link = await linkTarget(file),
+      folder = await isFolder(file),
       hash = await hashFile(file);
     if (link) {
-      return [path.relative(ROOT, file), `symlink:${link}:${hash}`];
+      return [path.relative(ROOT, file), `${SYMLINK}${link}:${hash}`];
+    }
+    if (folder) {
+      return [path.relative(ROOT, file), UNREADABLE_FOLDER];
     }
     return [path.relative(ROOT, file), hash];
   },
@@ -134,4 +144,4 @@ const AGENT_DIRS: readonly string[] = [".claude", ".codex", ".agents", ".cursor"
     return sha(toLine([shot.project, shot.ignored, entriesOf(shot.owned).filter(([file]) => !file.startsWith(mine))]));
   };
 
-export { agentConfigFiles, projectPrint, snapshot };
+export { agentConfigFiles, projectPrint, snapshot, SYMLINK, UNREADABLE_FOLDER };

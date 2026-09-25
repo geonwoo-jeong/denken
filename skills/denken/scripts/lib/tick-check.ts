@@ -4,6 +4,7 @@
  * not applied, and goes back to STARK with the reason.
  */
 import { fixItems, parseItems } from "./todo.ts";
+import { readCallFile, readRunFile } from "./store.ts";
 import type { Call } from "./types-items.ts";
 import type { RunStore } from "./types-store.ts";
 import { TODO_DEV } from "./paths.ts";
@@ -11,7 +12,6 @@ import type { TickEntry } from "./types-call.ts";
 import { changedSince } from "./changes.ts";
 import { itemBase } from "./tick-base.ts";
 import { namesFile } from "./tick-names.ts";
-import { readRunFile } from "./store.ts";
 import { tickPrefix } from "./ticks.ts";
 
 const NO_CHANGE_WITH_WHY = /^No change needed: \S/u,
@@ -57,7 +57,7 @@ const NO_CHANGE_WITH_WHY = /^No change needed: \S/u,
     return "";
   },
   logProblem = async (store: RunStore, entry: TickEntry): Promise<string> => {
-    const log = await readRunFile(store.dir, `calls/${entry.log}`);
+    const log = await readCallFile(store.dir, entry.log);
     if (!entry.command || !log.startsWith(`$ ${entry.command}\n`) || !PASSED.test(log)) {
       return "its test log does not show the recorded command passing";
     }

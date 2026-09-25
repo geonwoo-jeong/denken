@@ -11,7 +11,7 @@ import type { RunStore } from "./types-store.ts";
 import type { TickEntry } from "./types-call.ts";
 import { changeTree } from "./changes.ts";
 import { now } from "./text.ts";
-import { readRunFile } from "./store.ts";
+import { readCallFile } from "./store.ts";
 import { tickProblem } from "./tick-check.ts";
 
 const tickOne = async (runDir: string, entry: TickEntry): Promise<void> => {
@@ -45,7 +45,7 @@ const tickOne = async (runDir: string, entry: TickEntry): Promise<void> => {
     return [];
   },
   applyTicks = async (store: RunStore, call: Call): Promise<AppliedTicks> => {
-    const entries = callTicks(await readRunFile(store.dir, `calls/${call.id}.ticks.jsonl`)),
+    const entries = callTicks(await readCallFile(store.dir, `${call.id}.ticks.jsonl`)),
       problems = await mapAsync(entries, async (entry) => {
         const problem = await tickProblem(store, call, entry);
         return problem;

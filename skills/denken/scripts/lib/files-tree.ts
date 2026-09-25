@@ -1,21 +1,34 @@
 /*
  * Folders listed without following symlinks: a symlink an agent plants must never make the engine
  * read, copy or delete what it points to. listFiles gives regular files; listPaths also gives each
- * symlink itself, as the guard must see it.
+ * symlink itself, as the guard must see it, and each folder it could not read, as itself: an
+ * unreadable folder is not an empty one.
  */
 import { lstat, readdir, readlink } from "node:fs/promises";
 import { pathErrorOr, slotted } from "./fs-slot.ts";
 import type { Dirent } from "node:fs";
+import { codeOf } from "./text.ts";
 import path from "node:path";
 
 type Entries = readonly Readonly<Dirent>[];
 
-const readEntries = slotted(async (dir: string): Promise<Entries> => {
+// A folder's entries, or why it could not be read ("" when it could, or when it is not there).
+interface Listing {
+  readonly entries: Entries;
+  readonly unreadable: string;
+}
+
+const ABSENT: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]),
+  readEntries = slotted(async (dir: string): Promise<Listing> => {
     try {
       const entries: Entries = await readdir(dir, { withFileTypes: true });
-      return entries;
+      return { entries, unreadable: "" };
     } catch (error) {
-      return pathErrorOr(error, []);
+      const code = codeOf(error);
+      if (ABSENT.has(code)) {
+        return { entries: [], unreadable: "" };
+      }
+      return pathErrorOr(error, { entries: [], unreadable: code });
     }
   }),
   // Where a symlink points; empty when the path is not a symlink (or not there).
@@ -30,11 +43,11 @@ const readEntries = slotted(async (dir: string): Promise<Entries> => {
       return pathErrorOr(error, "");
     }
   }),
-  // Every path under a folder, depth first: regular files, plus symlinks when links is set.
+  // Every path under a folder, depth first: regular files, plus symlinks and unreadable folders when links is set.
   walk = async (dir: string, links: boolean): Promise<readonly string[]> => {
-    const entries = await readEntries(dir),
+    const listing = await readEntries(dir),
       nested = await Promise.all(
-        entries.map(async (entry): Promise<readonly string[]> => {
+        listing.entries.map(async (entry): Promise<readonly string[]> => {
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) {
             const inner = await walk(full, links);
@@ -46,6 +59,9 @@ const readEntries = slotted(async (dir: string): Promise<Entries> => {
           return [];
         }),
       );
+    if (listing.unreadable && links) {
+      return [dir];
+    }
     return nested.flat();
   },
   // Regular files under a folder; a folder that is itself a symlink has none.

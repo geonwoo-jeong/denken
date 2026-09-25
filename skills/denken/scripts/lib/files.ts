@@ -1,30 +1,39 @@
 /*
- * Files, read and written without blocking: text, and "binary" text (latin1, one character per
- * byte). Bulk reads take a slot (fs-slot.ts). A path that cannot be used (missing, a loop of
- * symlinks, no permission, not a regular file) reads as the fallback the caller gives; running out
- * of resources is thrown. Only regular files are read, so a FIFO or a device never hangs a read.
- *
- * Writes never go through a symlink or a hard link a call planted: a file is written whole into a
- * new file beside it and renamed over the path, and the folders on the way are checked
- * (files-path.ts). An append opens the file without following a symlink and refuses a hard link.
+ * Files, text and "binary" text (latin1). Bulk reads take a slot (fs-slot.ts). A path that cannot be
+ * used (missing, a symlink loop, no permission, not a regular file) reads as the caller's fallback;
+ * running out of resources is thrown. Reads open without blocking and check the open handle, so a
+ * FIFO or a device never hangs one. Writes never go through a symlink or hard link a call planted:
+ * a file is written whole beside the path and renamed over it, with the permission bits the caller
+ * gives, and the folders on the way are checked (files-path.ts). Appends neither follow a symlink,
+ * nor block, nor write to a hard link.
  */
 import { UnsafePathError, safeFolder } from "./files-path.ts";
-import { access, copyFile, lstat, open, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, copyFile, lstat, open, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { pathErrorOr, slotted } from "./fs-slot.ts";
+import { isPathError, pathErrorOr, slotted } from "./fs-slot.ts";
 import { codeOf } from "./text.ts";
 import { constants } from "node:fs";
 import path from "node:path";
 
 type Encoding = "latin1" | "utf8";
 
+// What a write puts in place: the text, how it is encoded, and the file's permission bits.
+interface Content {
+  readonly encoding: Encoding;
+  readonly mode: number;
+  readonly text: string;
+}
+
 const MISSING = "missing",
   ABSENT: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]),
   ONE_LINK = 1,
-  NEW_FILE_MODE = 0o666,
-  MODE_BITS = 0o7777,
+  // A new file's permission bits, before the umask: 0644 with the usual umask.
+  FILE_MODE = 0o666,
+  // Permission bits are the low twelve bits of a mode.
+  MODE_SPAN = 4096,
   // The open flags are single bits, so their sum is the set of all of them.
-  APPEND_FLAGS = constants.O_WRONLY + constants.O_APPEND + constants.O_CREAT + constants.O_NOFOLLOW,
+  READ_FLAGS = constants.O_RDONLY + constants.O_NONBLOCK,
+  APPEND_FLAGS = constants.O_WRONLY + constants.O_APPEND + constants.O_CREAT + constants.O_NOFOLLOW + constants.O_NONBLOCK,
   exists = slotted(async (target: string): Promise<boolean> => {
     try {
       await access(target);
@@ -35,15 +44,31 @@ const MISSING = "missing",
   }),
   // A regular file's content, through a symlink if need be; anything else is refused.
   readRegular = async (file: string, encoding: Encoding): Promise<string> => {
-    const info = await stat(file);
-    if (!info.isFile()) {
-      throw new UnsafePathError(`${file} is not a regular file`);
+    const handle = await open(file, READ_FLAGS);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw new UnsafePathError(`${file} is not a regular file`);
+      }
+      return await handle.readFile(encoding);
+    } finally {
+      await handle.close();
     }
-    return readFile(file, encoding);
   },
   readText = slotted(async (file: string): Promise<string> => {
     const text = await readRegular(file, "utf8");
     return text;
+  }),
+  // The engine's own file: empty when it is not there; any other failure is thrown, never read as empty.
+  readTextIfThere = slotted(async (file: string): Promise<string> => {
+    try {
+      return await readRegular(file, "utf8");
+    } catch (error) {
+      if (ABSENT.has(codeOf(error))) {
+        return "";
+      }
+      throw error;
+    }
   }),
   readTextOr = slotted(async (file: string, fallback: string): Promise<string> => {
     try {
@@ -52,6 +77,10 @@ const MISSING = "missing",
       return pathErrorOr(error, fallback);
     }
   }),
+  readBinary = slotted(async (file: string): Promise<string> => {
+    const text = await readRegular(file, "latin1");
+    return text;
+  }),
   readBinaryOr = slotted(async (file: string, fallback: string): Promise<string> => {
     try {
       return await readRegular(file, "latin1");
@@ -59,28 +88,45 @@ const MISSING = "missing",
       return pathErrorOr(error, fallback);
     }
   }),
-  // A path that is not there hashes as missing; one that cannot be read, as unreadable (a change, not an absence).
-  hashFailure = (error: unknown): string => {
-    const code = codeOf(error);
+  hashRegular = async (file: string): Promise<string> => {
+    const handle = await open(file, READ_FLAGS);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        return MISSING;
+      }
+      return createHash("sha256")
+        .update(await handle.readFile())
+        .digest("hex");
+    } finally {
+      await handle.close();
+    }
+  },
+  /*
+   * A path that is not there hashes as missing; one that cannot be read, as unreadable with its size
+   * and time, so it counts as a change (not an absence) and a later change to it still shows.
+   */
+  hashFailure = async (file: string, failure: unknown): Promise<string> => {
+    const code = codeOf(failure);
     if (ABSENT.has(code)) {
       return MISSING;
     }
-    return pathErrorOr(error, `unreadable:${code}`);
-  },
-  hashData = async (file: string): Promise<string> => {
-    const data = await readFile(file);
-    return createHash("sha256").update(data).digest("hex");
+    if (!isPathError(failure)) {
+      throw failure;
+    }
+    try {
+      const info = await lstat(file);
+      return `unreadable:${code}:${info.size}:${info.mtimeMs}`;
+    } catch (error) {
+      return pathErrorOr(error, `unreadable:${code}`);
+    }
   },
   // Only a regular file is read: a FIFO or a device behind a symlink would never end.
   hashFile = slotted(async (file: string): Promise<string> => {
     try {
-      const info = await stat(file);
-      if (!info.isFile()) {
-        return MISSING;
-      }
-      return await hashData(file);
+      return await hashRegular(file);
     } catch (error) {
-      return hashFailure(error);
+      return hashFailure(file, error);
     }
   }),
   // The names in a folder; a missing folder has none.
@@ -91,17 +137,10 @@ const MISSING = "missing",
       return pathErrorOr(error, []);
     }
   }),
-  // The permission bits a replaced file keeps; a new file gets the default.
-  modeOf = async (file: string): Promise<number> => {
-    try {
-      const info = await lstat(file);
-      if (info.isFile()) {
-        return info.mode % (MODE_BITS + ONE_LINK);
-      }
-      return NEW_FILE_MODE;
-    } catch (error) {
-      return pathErrorOr(error, NEW_FILE_MODE);
-    }
+  // A regular file's permission bits, through a symlink if need be.
+  fileMode = async (file: string): Promise<number> => {
+    const info = await stat(file);
+    return info.mode % MODE_SPAN;
   },
   tempFor = (file: string): string => path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`),
   // The temporary file renamed over the path; left behind by a failed rename, it is removed.
@@ -113,9 +152,9 @@ const MISSING = "missing",
       throw error;
     }
   },
-  replaceWith = async (file: string, text: string, encoding: Encoding): Promise<void> => {
+  replaceWith = async (file: string, content: Content): Promise<void> => {
     const temp = tempFor(file);
-    await writeFile(temp, text, { encoding, flag: "wx", mode: await modeOf(file) });
+    await writeFile(temp, content.text, { encoding: content.encoding, flag: "wx", mode: content.mode });
     await renameOver(temp, file);
   },
   makeDir = async (dir: string): Promise<void> => {
@@ -124,20 +163,20 @@ const MISSING = "missing",
   // Text written whole: a reader never sees half a file.
   writeText = async (file: string, text: string): Promise<void> => {
     await safeFolder(path.dirname(file), false);
-    await replaceWith(file, text, "utf8");
+    await replaceWith(file, { encoding: "utf8", mode: FILE_MODE, text });
   },
   // Text written in a folder that may not exist yet.
   writeInto = async (file: string, text: string): Promise<void> => {
     await safeFolder(path.dirname(file), true);
-    await replaceWith(file, text, "utf8");
+    await replaceWith(file, { encoding: "utf8", mode: FILE_MODE, text });
   },
-  // Binary text written back, with its folder made first when it is gone.
-  writeBinary = async (file: string, text: string): Promise<void> => {
+  // Binary text written back with the given permission bits, its folder made first when it is gone.
+  writeBinary = async (file: string, text: string, mode: number = FILE_MODE): Promise<void> => {
     await safeFolder(path.dirname(file), true);
-    await replaceWith(file, text, "latin1");
+    await replaceWith(file, { encoding: "latin1", mode, text });
   },
   appendOpen = async (file: string, text: string): Promise<void> => {
-    const handle = await open(file, APPEND_FLAGS, NEW_FILE_MODE);
+    const handle = await open(file, APPEND_FLAGS, FILE_MODE);
     try {
       const info = await handle.stat();
       if (!info.isFile() || info.nlink > ONE_LINK) {
@@ -187,6 +226,14 @@ const MISSING = "missing",
     const real = await realpath(target);
     return real;
   },
+  // Empty when the path does not resolve (gone, a loop, no permission).
+  realPathOr = async (target: string): Promise<string> => {
+    try {
+      return await realpath(target);
+    } catch (error) {
+      return pathErrorOr(error, "");
+    }
+  },
   linkTo = async (target: string, link: string): Promise<void> => {
     await safeFolder(path.dirname(link), false);
     await symlink(target, link);
@@ -211,24 +258,39 @@ const MISSING = "missing",
     } catch (error) {
       return pathErrorOr(error, false);
     }
+  }),
+  // A folder, itself: a symlink to one is not.
+  isFolder = slotted(async (target: string): Promise<boolean> => {
+    try {
+      const info = await lstat(target);
+      return info.isDirectory();
+    } catch (error) {
+      return pathErrorOr(error, false);
+    }
   });
 
 export {
   appendText,
   copyInto,
   exists,
+  FILE_MODE,
+  fileMode,
   hashFile,
   isFile,
+  isFolder,
   linkTo,
   listNames,
   makeDir,
   MISSING,
   modifiedAt,
   movePath,
+  readBinary,
   readBinaryOr,
   readText,
+  readTextIfThere,
   readTextOr,
   realPath,
+  realPathOr,
   removePath,
   sizeOf,
   touch,

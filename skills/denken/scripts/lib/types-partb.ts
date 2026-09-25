@@ -1,9 +1,9 @@
 // Shapes the _exec runner hands between its phases: the command-line context, runs and their reports.
-import type { CliResult, Snapshot } from "./types-work.ts";
+import type { CliResult, Pins, Snapshot } from "./types-work.ts";
 import type { ContinueMeta, Facts, Job, Meta, NoPlan, SeedMeta, Tokens } from "./types-call.ts";
 import type { Grants, Provider } from "./types-config.ts";
-import type { Mode, Tree } from "./types-names.ts";
 import type { Denial } from "./types-items.ts";
+import type { Mode } from "./types-names.ts";
 
 /*
  * What a call's command line depends on: its mode and agent, its files, what it may do, and
@@ -79,11 +79,12 @@ interface CallContext {
 interface Guards {
   readonly before: Snapshot;
   readonly gitPinned: readonly PinnedFile[];
-  readonly pinned: Tree;
+  readonly pinned: Pins;
 }
 
 /*
- * A git file as it was: its content (latin1) when present; where it pointed, and the real path it
+ * A git file as it was: its content (latin1) and permission bits when present (or why it could not
+ * be read); where it pointed, and the real path it
  * resolved to, when a symlink; and, for a file in a folder of the git dir (info/exclude), where
  * that folder pointed.
  */
@@ -91,10 +92,12 @@ interface PinnedFile {
   readonly content: string;
   readonly folder: string;
   readonly link: string;
+  readonly mode: number;
   readonly nested: boolean;
   readonly path: string;
   readonly present: boolean;
   readonly real: string;
+  readonly unreadable: string;
 }
 
 // How a call ran: the session it continued, the seed it forked, and the run itself.

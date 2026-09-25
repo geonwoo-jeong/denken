@@ -18,6 +18,7 @@ import type { TickEntry } from "./types-call.ts";
 import path from "node:path";
 
 const NOT_FOUND = -1,
+  SHA256 = /^[\da-f]{64}$/u,
   SUCCESS = 0,
   UNKNOWN_EXIT = -1,
   EVIDENCE_MAX = 400,
@@ -85,10 +86,11 @@ const NOT_FOUND = -1,
   },
   // One call's ticks, the last record per item, in the order the items were first ticked.
   callTicks = (text: string): readonly TickEntry[] => Object.values(latestOf(ledgerRecords(text), () => true)),
+  // A record whose log still has the sha it recorded: a real sha, never a mark such as "missing".
   intact = async (runDir: string, entries: readonly TickEntry[]): Promise<readonly TickEntry[]> => {
     const checks = await mapAsync(entries, async (entry) => {
       const hash = await hashFile(path.join(runDir, "calls", entry.log));
-      return hash === entry.logSha;
+      return SHA256.test(entry.logSha) && hash === entry.logSha;
     });
     return entries.filter((_entry, index) => checks[index] === true);
   },

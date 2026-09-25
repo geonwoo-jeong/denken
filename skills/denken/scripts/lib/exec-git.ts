@@ -8,27 +8,20 @@
  * symlink that was there before is the user's own: the file behind it is restored only while the
  * symlink still resolves to the same real file, else it is reported and left alone.
  */
-import { exists, linkTo, makeDir, readBinaryOr, realPath, removePath, writeBinary } from "./files.ts";
+import { FILE_MODE, exists, linkTo, makeDir, readBinaryOr, realPathOr, removePath, writeBinary } from "./files.ts";
+import type { Found, Pin } from "./types-work.ts";
 import { mapAsync, mapInOrder } from "./lists.ts";
-import type { Found } from "./types-work.ts";
 import type { PinnedFile } from "./types-partb.ts";
 import { ROOT } from "./paths.ts";
 import { captureEvidence } from "./evidence.ts";
 import { gitText } from "./git.ts";
 import { linkTarget } from "./files-tree.ts";
 import path from "node:path";
-import { pathErrorOr } from "./fs-slot.ts";
+import { pinFile } from "./pin.ts";
 
 const GIT_FILES: readonly string[] = ["config", "info/exclude"],
   OUTSIDE = /^(?:\.\.\/)+/u,
   NOTHING: Found = { evidence: [], lines: [] },
-  realOr = async (file: string): Promise<string> => {
-    try {
-      return await realPath(file);
-    } catch (error) {
-      return pathErrorOr(error, "");
-    }
-  },
   folderLink = async (file: string, nested: boolean): Promise<string> => {
     if (!nested) {
       return "";
@@ -36,15 +29,29 @@ const GIT_FILES: readonly string[] = ["config", "info/exclude"],
     const link = await linkTarget(path.dirname(file));
     return link;
   },
+  // Where git keeps the file. Git that cannot say (its config unreadable, say) stops the call: an unpinned config is an unguarded one.
+  gitPath = async (name: string): Promise<string> => {
+    const named = await gitText(["rev-parse", "--git-path", name]);
+    if (!named || named.includes("\n")) {
+      throw new Error(`git could not name its ${name} file, so the guard cannot pin it and the call does not run; check that .git/config is readable`);
+    }
+    return path.resolve(ROOT, named);
+  },
+  pinParts = (pins: readonly Pin[]): Pick<PinnedFile, "content" | "mode" | "present" | "unreadable"> => {
+    const [pin] = pins;
+    if (!pin) {
+      return { content: "", mode: FILE_MODE, present: false, unreadable: "" };
+    }
+    return { content: pin.content, mode: pin.mode, present: true, unreadable: pin.unreadable };
+  },
   pinGitFile = async (name: string): Promise<PinnedFile> => {
-    const file = path.resolve(ROOT, await gitText(["rev-parse", "--git-path", name])),
+    const file = await gitPath(name),
       nested = name.includes("/"),
       folder = await folderLink(file, nested),
       link = await linkTarget(file),
-      real = await realOr(file),
-      present = await exists(file),
-      content = await readBinaryOr(file, "");
-    return { content, folder, link, nested, path: file, present, real };
+      real = await realPathOr(file),
+      parts = pinParts(await pinFile(file));
+    return { content: parts.content, folder, link, mode: parts.mode, nested, path: file, present: parts.present, real, unreadable: parts.unreadable };
   },
   pinGitFiles = async (): Promise<readonly PinnedFile[]> => {
     const pinned = await mapAsync(GIT_FILES, pinGitFile);
@@ -77,11 +84,11 @@ const GIT_FILES: readonly string[] = ["config", "info/exclude"],
   },
   // Behind the user's own symlink: written only while it resolves to the same real file.
   writeBehind = async (pinned: PinnedFile): Promise<string> => {
-    const real = await realOr(pinned.path);
+    const real = await realPathOr(pinned.path);
     if (real !== pinned.real) {
       return `git file changed: ${shown(pinned.path)} (not restored: its symlink now resolves to ${real || "nothing"}, not ${pinned.real})`;
     }
-    await writeBinary(real, pinned.content);
+    await writeBinary(real, pinned.content, pinned.mode);
     return `git file changed: ${shown(pinned.path)} (restored)`;
   },
   // The file as it was before the call: its symlink, its content, or no file at all.
@@ -94,15 +101,23 @@ const GIT_FILES: readonly string[] = ["config", "info/exclude"],
       return line;
     }
     if (pinned.present) {
-      await writeBinary(pinned.path, pinned.content);
+      await writeBinary(pinned.path, pinned.content, pinned.mode);
     } else if (!pinned.link) {
       await removePath(pinned.path);
     }
     return `git file changed: ${shown(pinned.path)} (restored)`;
   },
+  // A file that could not be read before the call has nothing to restore from: writing "" would erase it.
+  restoreOrReport = async (pinned: PinnedFile, now: string): Promise<string> => {
+    if (pinned.unreadable) {
+      return `git file changed: ${shown(pinned.path)} (not restored: it could not be read before the call: ${pinned.unreadable})`;
+    }
+    const line = await putBack(pinned, now);
+    return line;
+  },
   changedFile = async (pinned: PinnedFile, now: string): Promise<Found> => {
     const evidence = await captureEvidence(pinned.path, gitRel(pinned.path)),
-      line = await putBack(pinned, now);
+      line = await restoreOrReport(pinned, now);
     return { evidence, lines: [line] };
   },
   restoreFile = async (pinned: PinnedFile): Promise<Found> => {

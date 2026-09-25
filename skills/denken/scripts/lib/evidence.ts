@@ -12,23 +12,42 @@ import { messageOf } from "./text.ts";
 import path from "node:path";
 import { pathErrorOr } from "./fs-slot.ts";
 
+/*
+ * Evidence is held in memory until the repairs are done, so it is capped: 16 MiB for one file, and
+ * 64 MiB for everything one engine process keeps. Past the cap, only the size is kept.
+ */
 const MAX_BYTES = 16_777_216,
+  TOTAL_BYTES = 67_108_864,
+  budget = { left: TOTAL_BYTES },
   OUTSIDE = /^(?:\.\.\/)+/u,
   // Where a path's evidence goes: a path outside the project is kept under outside/.
   evidencePath = (rel: string): string => rel.replace(OUTSIDE, "outside/"),
+  tooLarge = (rel: string, size: number): Evidence => ({ content: `${size} bytes, too large to keep\n`, path: `${evidencePath(rel)}.too-large` }),
+  // Whether this much more may be held; if so, it is counted.
+  fits = (size: number): boolean => {
+    if (size > MAX_BYTES || size > budget.left) {
+      return false;
+    }
+    budget.left -= size;
+    return true;
+  },
   fileEvidence = async (file: string, rel: string): Promise<Evidence> => {
     const size = await sizeOf(file);
-    if (size > MAX_BYTES) {
-      return { content: `${size} bytes, too large to keep\n`, path: `${evidencePath(rel)}.too-large` };
+    if (!fits(size)) {
+      return tooLarge(rel, size);
     }
     return { content: await readBinaryOr(file, ""), path: evidencePath(rel) };
   },
   folderEvidence = async (file: string, rel: string): Promise<readonly Evidence[]> => {
-    const inside = await listPaths(file);
+    const inside = await listPaths(file),
+      listing = `${inside.map((entry) => path.relative(file, entry)).join("\n")}\n`;
     if (!hasItems(inside)) {
       return [];
     }
-    return [{ content: `${inside.map((entry) => path.relative(file, entry)).join("\n")}\n`, path: `${evidencePath(rel)}.listing` }];
+    if (!fits(listing.length)) {
+      return [tooLarge(`${rel}.listing`, listing.length)];
+    }
+    return [{ content: listing, path: `${evidencePath(rel)}.listing` }];
   },
   // What is at a path now: a symlink as where it points, a file as its content, a folder as what is in it.
   captureEvidence = async (file: string, rel: string): Promise<readonly Evidence[]> => {

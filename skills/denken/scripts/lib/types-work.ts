@@ -21,13 +21,13 @@ interface Snapshot {
   readonly project: string;
 }
 
-// What a guard compares after a call, and the pinned contents (latin1) of DENKEN's files to restore.
+// What a guard compares after a call, and DENKEN's files as pinned before it, to restore them from.
 interface ViolationCheck {
   readonly after: Snapshot;
   readonly before: Snapshot;
   readonly callId: string;
   readonly guard: Guard;
-  readonly pinned: Tree;
+  readonly pinned: Pins;
   readonly runDir: string;
 }
 
@@ -39,6 +39,15 @@ interface Evidence {
   readonly content: string;
   readonly path: string;
 }
+
+// A file as the guard pinned it: its content (latin1) and permission bits, or why it could not be read.
+interface Pin {
+  readonly content: string;
+  readonly mode: number;
+  readonly unreadable: string;
+}
+
+type Pins = Readonly<Record<string, Pin>>;
 
 // What a guard found: the lines to report, and the evidence to keep.
 interface Found {
@@ -113,4 +122,4 @@ interface GrantSet {
   readonly grants: Grants;
 }
 
-export type { AppliedTicks, Choices, CliResult, CliRun, ConfigPaths, Evidence, Found, GrantSet, ItemBase, RelatedDoc, Snapshot, StageChanges, StartPlans, TickRejection, ViolationCheck };
+export type { AppliedTicks, Choices, CliResult, CliRun, ConfigPaths, Evidence, Found, GrantSet, ItemBase, Pin, Pins, RelatedDoc, Snapshot, StageChanges, StartPlans, TickRejection, ViolationCheck };

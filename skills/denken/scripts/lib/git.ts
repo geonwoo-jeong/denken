@@ -46,16 +46,27 @@ const SUCCESS = 0,
     const lines = await gitLines(["config", "--get-regexp", String.raw`^filter\.`]);
     return unique(lines.map((line) => groupOf(DRIVER, line, "driver")).filter(Boolean));
   },
+  // Every filter driver in the repository config, switched off for one command.
+  filtersOff = async (args: readonly string[]): Promise<readonly string[]> => {
+    const drivers = await filterDrivers(),
+      off = drivers.flatMap((driver) => ["-c", `filter.${driver}.clean=`, "-c", `filter.${driver}.smudge=`, "-c", `filter.${driver}.process=`, "-c", `filter.${driver}.required=false`]);
+    return [...SAFE, ...off, ...safeArgs(args).slice(SAFE.length)];
+  },
   /*
    * Git in a given directory, for the work on units (worktrees, patches, the base commit), with
    * the same protections, and with every filter driver in the repository config switched off.
    */
   gitAt = async (dir: string, args: readonly string[], options: GitOptions = {}): Promise<GitResult> => {
-    const drivers = await filterDrivers(),
-      off = drivers.flatMap((driver) => ["-c", `filter.${driver}.clean=`, "-c", `filter.${driver}.smudge=`, "-c", `filter.${driver}.process=`, "-c", `filter.${driver}.required=false`]),
-      [, ...safe] = ["git", ...safeArgs(args)],
-      result = await runProcess("git", [...SAFE, ...off, ...safe.slice(SAFE.length)], { cwd: dir, env: Object.assign(gitEnv(), options.env), input: options.input ?? "" });
+    const result = await runProcess("git", await filtersOff(args), { cwd: dir, env: Object.assign(gitEnv(), options.env), input: options.input ?? "" });
     return { err: result.stderr.trim(), ok: result.status === SUCCESS, out: result.bytes, text: result.stdout.trim() };
+  },
+  // Stdout of a git command for the guard's snapshot: no filter driver runs while the guard looks.
+  gitGuardBinary = async (args: readonly string[]): Promise<string> => {
+    const result = await runProcess("git", await filtersOff(args), { cwd: ROOT, env: gitEnv() });
+    if (result.status === SUCCESS) {
+      return result.bytes;
+    }
+    return "";
   };
 
-export { gitAt, gitBinary, gitLines, gitText };
+export { gitAt, gitBinary, gitGuardBinary, gitLines, gitText };

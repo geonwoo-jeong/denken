@@ -10,7 +10,7 @@ import { foundSoFar, guardFound } from "./exec-found.ts";
 import { hasItems } from "./lists.ts";
 import { messageOf } from "./text.ts";
 import { pinGitFiles } from "./exec-git.ts";
-import { pinOwned } from "./guard.ts";
+import { pinOwned } from "./pin.ts";
 import { seedToFork } from "./exec-start.ts";
 import { snapshot } from "./guard-snapshot.ts";
 import { undoneMeta } from "./exec-meta.ts";

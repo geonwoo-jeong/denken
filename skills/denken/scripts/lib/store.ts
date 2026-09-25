@@ -1,6 +1,6 @@
 // Finding a run's directory, and loading, holding and saving its state.json.
 import { ROOT, STATE_FILE } from "./paths.ts";
-import { exists, readTextOr, writeText } from "./files.ts";
+import { exists, readTextIfThere, readTextOr, writeText } from "./files.ts";
 import { isRecord, parseJson, toJson } from "./json.ts";
 import type { RunState } from "./types-run.ts";
 import type { RunStore } from "./types-store.ts";
@@ -29,7 +29,7 @@ const isRunState = (value: unknown): value is RunState =>
   },
   loadState = async (dir: string): Promise<RunState> => {
     const file = path.join(dir, STATE_FILE),
-      parsed = parseJson(await readTextOr(file, ""));
+      parsed = parseJson(await readTextIfThere(file));
     if (parsed.ok && isRunState(parsed.value)) {
       return parsed.value;
     }
@@ -55,8 +55,13 @@ const isRunState = (value: unknown): value is RunState =>
   },
   // A file of the run: its text, or empty when it does not exist.
   readRunFile = async (runDir: string, name: string): Promise<string> => {
-    const text = await readTextOr(path.join(runDir, name), "");
+    const text = await readTextIfThere(path.join(runDir, name));
+    return text;
+  },
+  // A file a call wrote under calls/: whatever the call left there (a folder, a FIFO) reads as empty.
+  readCallFile = async (runDir: string, name: string): Promise<string> => {
+    const text = await readTextOr(path.join(runDir, "calls", name), "");
     return text;
   };
 
-export { isRunState, loadState, makeStore, openStore, readRunFile, runDirOf };
+export { isRunState, loadState, makeStore, openStore, readCallFile, readRunFile, runDirOf };

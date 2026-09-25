@@ -12,23 +12,37 @@ const LIMIT = 64,
   STEP = 1,
   // Running out of something the whole process needs: no answer about any one path.
   RESOURCE: ReadonlySet<string> = new Set(["EAGAIN", "EBUSY", "EIO", "EMFILE", "ENFILE", "ENOMEM"]),
+  // Waiters are taken from the head without shifting the array; it is dropped once drained, or trimmed when long.
+  TRIM_AT = 4096,
+  START = 0,
   counter = { active: 0 },
-  waiters: Wake[] = [],
+  queue: { head: number; items: Wake[] } = { head: START, items: [] },
   take = async (): Promise<void> => {
     if (counter.active < LIMIT) {
       counter.active += STEP;
       return;
     }
     const { promise, resolve } = Promise.withResolvers<boolean>();
-    waiters.push(() => {
+    queue.items.push(() => {
       resolve(true);
     });
     await promise;
   },
+  advance = (): void => {
+    queue.head += STEP;
+    if (queue.head === queue.items.length) {
+      queue.items = [];
+      queue.head = START;
+    } else if (queue.head >= TRIM_AT) {
+      queue.items = queue.items.slice(queue.head);
+      queue.head = START;
+    }
+  },
   // The slot passes straight to the next waiter, or is freed when none waits.
   give = (): void => {
-    const next = waiters.shift();
+    const next = queue.items[queue.head];
     if (next) {
+      advance();
       next();
       return;
     }
@@ -42,7 +56,7 @@ const LIMIT = 64,
       give();
     }
   },
-  // A file operation that takes a slot while it runs.
+  // A file operation that takes a slot while it runs. It must not call another slotted operation: with every slot taken, the inner one would wait forever.
   slotted =
     <Args extends readonly unknown[], Result>(work: (...args: Args) => Promise<Result>) =>
     async (...args: Args): Promise<Result> => {
@@ -57,12 +71,15 @@ const LIMIT = 64,
    * path must not stop a guard. Running out of resources, or an error that is about no path at all,
    * is thrown on.
    */
-  pathErrorOr = <Value>(error: unknown, fallback: Value): Value => {
+  isPathError = (error: unknown): boolean => {
     const code = codeOf(error);
-    if (code && !RESOURCE.has(code)) {
+    return Boolean(code) && !RESOURCE.has(code);
+  },
+  pathErrorOr = <Value>(error: unknown, fallback: Value): Value => {
+    if (isPathError(error)) {
       return fallback;
     }
     throw error;
   };
 
-export { pathErrorOr, slotted, withSlot };
+export { isPathError, pathErrorOr, slotted, withSlot };
