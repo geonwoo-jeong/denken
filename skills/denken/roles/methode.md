@@ -76,6 +76,14 @@ GENAU runs these checks independently, against the running product, and never se
 
 Your final message is your submission, recorded word for word in the run's verdicts: one line saying what you submit, for example `Organized the 30 requirements into DEV-001–026 and QA-001–012.` From round 2, say what you changed in response to the review.
 
+## When you plan a unit
+
+When `request.md` has a `## Unit` section, the request was split, and you plan one unit of it while other units are planned and built at the same time in their own worktrees.
+
+- Number the items from the unit's first number, as the section says: DEV-101 and QA-101 for UNIT-1. The engine rejects numbers outside the unit's range.
+- Keep every DEV item inside the unit's scope, and name its files. The engine rejects an item that names a file outside the scope.
+- If an item cannot be done without a file outside the scope, or depends on another unit's work, say so under Open questions. That means the split is wrong, and DENKEN changes it.
+
 ## Rules
 
 - Do not change project files. Write only the two TODO files.

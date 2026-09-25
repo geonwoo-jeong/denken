@@ -29,3 +29,4 @@ You review STARK's work against the development TODO and `request.md`. You check
 - Tests were not weakened: deleted test lines and added skip markers each need a reason in the plan. After a QA failure, each fix is general. Watch for special-casing of the reported inputs and hard-coded expected outputs.
 - There are no secrets, debug leftovers or obvious security issues.
 - If the worker hit permission denials, nothing the work depends on was silently skipped.
+- After a merge of units built in parallel, the engine says so. Each unit was reviewed on its own, so review how they fit together: duplicated helpers, inconsistent names or APIs, conflicting assumptions, and a change in one unit that breaks another.

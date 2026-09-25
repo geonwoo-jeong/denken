@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Stand-in for the claude and codex CLIs in tests, scripted by the JSON file in $FAKE_SCENARIO.
-// Scenario keys are "<stage>-<role>-<round>". A value is one step, or an array of steps for
-// successive attempts of the same call. A step can set:
+// Scenario keys are "<stage>-<role>-<round>", or "<unit>:<stage>-<role>-<round>" for a unit's
+// calls (UNIT-1:dev-stark-1). A value is one step, or an array of steps for successive attempts
+// of the same call. In a unit, METHODE plans from the unit's request.md and STARK works in the
+// unit's scope (<first scope folder>/work.txt). A step can set:
 //   review | qa   the structured final message (default: approve / pass every QA item)
 //   todoDev       text METHODE writes to todo-dev.md (default covers REQ-001 and REQ-002)
 //   todoQa        text METHODE writes to todo-qa.md (default covers REQ-001 and REQ-002)
@@ -23,7 +25,9 @@
 //   requestPermission { need, why }: ask DENKEN for a permission, then stop
 //   evidenceText  extra text GENAU puts in each evidence file
 //   report        text STARK writes to dev-report.md
-//   touch         a path to append to, relative to the project ("$RUN" is the run directory)
+//   touch         a path to append to, relative to the project ("$RUN" is the run directory,
+//                 "$PROJ" the main project, where units are merged)
+//   devFiles      in a unit: the files METHODE's DEV items name (default: <scope>/work.txt)
 //   fail          exit 1 with this text on stderr
 //   denials       permission denials to report (claude only)
 //   sleepMs       wait this long before answering
@@ -53,7 +57,13 @@ const scenario = JSON.parse(readFileSync(scenarioPath, "utf8"));
 const role = prompt.match(/^# (\w+):/m)[1].toLowerCase();
 const [, stage, round] = prompt.match(/- Stage: (\w+), round (\d+)/);
 const runDir = prompt.match(/- Run directory: (.+)/)[1];
-const key = `${stage}-${role}-${round}`;
+const unit = prompt.match(/^- Unit: (UNIT-\d+)/m)?.[1] ?? null;
+const callId = `${stage}-${role}-${round}`;
+const key = `${unit ? `${unit}:` : ""}${callId}`;
+// In a unit, the file STARK works on: <first scope folder>/work.txt, or the first scope file.
+const request = existsSync(join(runDir, "request.md")) ? readFileSync(join(runDir, "request.md"), "utf8") : "";
+const scopeFirst = request.match(/^- Scope: `([^`]+)`/m)?.[1];
+const devFile = unit ? (scopeFirst.endsWith("/") ? `${scopeFirst}work.txt` : scopeFirst) : "src.txt";
 const readOnly = args.includes("read-only") || args.includes("dontAsk");
 const network = readOnly
   ? "-"
@@ -79,11 +89,11 @@ if (step.spawnLate) {
 }
 // Write a finished-looking result from some other attempt of this call, then keep working.
 if (step.staleMeta) {
-  writeFileSync(join(runDir, "calls", `${key}.meta.json`), JSON.stringify({ status: "ok", nonce: "earlier-attempt" }));
+  writeFileSync(join(runDir, "calls", `${callId}.meta.json`), JSON.stringify({ status: "ok", nonce: "earlier-attempt" }));
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
 }
 if (step.touch) {
-  const target = step.touch.replace("$RUN", runDir);
+  const target = step.touch.replace("$RUN", runDir).replace("$PROJ", join(dirname(scenarioPath), "proj"));
   appendFileSync(isAbsolute(target) ? target : join(process.cwd(), target), "tampered\n");
 }
 if (step.fail) {
@@ -100,8 +110,8 @@ if (step.requestPermission) {
 } else if (["richter", "ubel", "frieren"].includes(role)) final = step.review ?? { verdict: "APPROVED", summary: `${role} found nothing to change`, findings: [], checked: ["fake review"] };
 else if (role === "genau") {
   // Leave an evidence file per item, as GENAU does, and point to it from the report.
-  final = step.qa ?? { result: "PASS", summary: "every check passed on the running product", items: [pass(1), pass(2)] };
-  const evidence = join(runDir, "calls", `${key}.evidence`);
+  final = step.qa ?? { result: "PASS", summary: "every check passed on the running product", items: listedChecks() ?? [pass(1), pass(2)] };
+  const evidence = join(runDir, "calls", `${callId}.evidence`);
   mkdirSync(evidence, { recursive: true });
   for (const item of final.items) {
     writeFileSync(join(evidence, `${item.id}.txt`), `${item.id}: ${item.result}\n${step.evidenceText ?? ""}`);
@@ -110,9 +120,10 @@ else if (role === "genau") {
 }
 else {
   const writes = (prompt.match(/- Write:\n((?: {2}- .+\n?)+)/)?.[1] ?? "").split("\n").map((l) => l.replace(/^ {2}- /, "").trim()).filter(Boolean);
+  const planned = unit ? planFromRequest(step) : null;
   for (const file of writes) {
     const name = basename(file);
-    const content = name === "todo-dev.md" ? step.todoDev ?? DEFAULT_TODO_DEV : name === "todo-qa.md" ? step.todoQa ?? DEFAULT_TODO_QA : name === "dev-report.md" && step.report ? step.report : `# ${role} round ${round}\n`;
+    const content = name === "todo-dev.md" ? step.todoDev ?? planned?.dev ?? DEFAULT_TODO_DEV : name === "todo-qa.md" ? step.todoQa ?? planned?.qa ?? DEFAULT_TODO_QA : name === "dev-report.md" && step.report ? step.report : `# ${role} round ${round}\n`;
     writeFileSync(file, content);
   }
   for (const [path, content] of Object.entries(step.editFiles ?? {})) {
@@ -122,14 +133,15 @@ else {
   for (const path of step.removeFiles ?? []) rmSync(join(process.cwd(), path), { force: true });
   for (const [path, text] of Object.entries(step.appendFiles ?? {})) appendFileSync(join(process.cwd(), path), text);
   if (stage === "dev") {
-    appendFileSync(join(process.cwd(), "src.txt"), `change ${round}\n`);
+    mkdirSync(dirname(join(process.cwd(), devFile)), { recursive: true });
+    appendFileSync(join(process.cwd(), devFile), `change ${round}\n`);
     // Tick DEV items off through the engine's tick command, as STARK does once an item's tests pass.
     const todo = join(runDir, "todo-dev.md");
     const [, script] = prompt.match(/node "([^"]+)" tick "/);
     const ids = [...readFileSync(todo, "utf8").matchAll(/^\s*[-*]\s*\[[ xX]\]\s*DEV-(\d{3,})\b/gm)].map((m) => Number(m[1]));
     for (const id of ids.filter((id) => !step.tick || step.tick.includes(id))) {
       if (step.tickByHand?.includes(id)) continue;
-      const why = step.noChange?.[id] ? ["--no-change", step.noChange[id]] : ["--evidence", step.evidence ?? "changed src.txt"];
+      const why = step.noChange?.[id] ? ["--no-change", step.noChange[id]] : ["--evidence", step.evidence ?? `changed ${devFile}`];
       spawnSync(process.execPath, [script, "tick", runDir, `DEV-${pad(id)}`, ...why, "--", ...(step.tickFail?.includes(id) ? ["false"] : step.tickArgs ?? ["echo", "ok"])], { stdio: "ignore" });
     }
     // Recovery items of the latest QA cycle, when there are any.
@@ -138,7 +150,7 @@ else {
       const latest = readFileSync(fix, "utf8").split(/^## QA cycle \d+/m).at(-1);
       for (const m of latest.matchAll(/^\s*[-*]\s*\[ \]\s*(FIX-\d{3,})\b/gm)) {
         if (step.fixTick === false) break;
-        spawnSync(process.execPath, [script, "tick", runDir, m[1], "--evidence", step.fixEvidence ?? "fixed the cause in src.txt", "--", "echo", "fixed"], { stdio: "ignore" });
+        spawnSync(process.execPath, [script, "tick", runDir, m[1], "--evidence", step.fixEvidence ?? `fixed the cause in ${devFile}`, "--", "echo", "fixed"], { stdio: "ignore" });
       }
     }
     const setBox = (id, box) => writeFileSync(todo, readFileSync(todo, "utf8").replace(new RegExp(`^(\\s*[-*]\\s*)\\[[ xX]\\](\\s*${id}\\b)`, "m"), `$1[${box}]$2`));
@@ -148,11 +160,11 @@ else {
     for (const [from, to] of step.editTodo ?? []) writeFileSync(todo, readFileSync(todo, "utf8").replace(from, to));
     // A forged record: a passing-looking log and a ledger line whose sha matches it.
     for (const f of step.forgeTicks ?? []) {
-      const log = f.log ?? `${key}.tick-${f.item}.log`;
+      const log = f.log ?? `${callId}.tick-${f.item}.log`;
       const text = "$ echo ok\n--- stdout ---\nok\n\n--- stderr ---\n\n[exit 0]\n";
       writeFileSync(join(runDir, "calls", log), text);
       const logSha = createHash("sha256").update(text).digest("hex");
-      appendFileSync(join(runDir, "calls", `${key}.ticks.jsonl`), `${JSON.stringify({ item: f.item, command: "echo ok", evidence: f.evidence, noChange: false, exitCode: 0, at: new Date().toISOString(), lastLine: "ok", log, logSha })}\n`);
+      appendFileSync(join(runDir, "calls", `${callId}.ticks.jsonl`), `${JSON.stringify({ item: f.item, command: "echo ok", evidence: f.evidence, noChange: false, exitCode: 0, at: new Date().toISOString(), lastLine: "ok", log, logSha })}\n`);
     }
   }
   if (stage === "wiki") appendFileSync(join(process.cwd(), "docs.md"), `doc ${round}\n`);
@@ -168,4 +180,28 @@ if (cli === "claude") {
 } else {
   writeFileSync(args[args.indexOf("-o") + 1], text);
   console.log(JSON.stringify({ type: "thread.started", thread_id: `thread-${key}` }));
+}
+
+// A passing answer for every QA item listed in todo-qa.md.
+function listedChecks() {
+  const path = join(runDir, "todo-qa.md");
+  if (!existsSync(path)) return null;
+  const items = [...readFileSync(path, "utf8").matchAll(/^- \[[ xX]\] (QA-\d{3,}) \(([^)]*)\)\s*(.*)$/gm)];
+  return items.length ? items.map(([, id, refs, text]) => ({ id, request_item: refs.match(/REQ-\d{3,}/)?.[0] ?? null, check: text.slice(0, 60), how_verified: "fake", result: "PASS", evidence: "ok", reproduce: null })) : null;
+}
+
+// A unit's TODO lists, written from its request.md the way METHODE would: every item copied, one
+// DEV and one QA item per REQ item, numbered from the unit's first number.
+function planFromRequest(step) {
+  const part = (heading) => (request.split(new RegExp(`^## ${heading}\\s*$`, "m"))[1] ?? "").split(/^## /m)[0];
+  const items = (heading, prefix) => part(heading).split("\n").filter((l) => new RegExp(`^- ${prefix}-\\d{3,}`).test(l));
+  const first = Number(request.match(/Number this unit's items from (\d+)/)?.[1] ?? 1);
+  const reqs = items("Confirmed", "REQ").map((l) => [l, l.match(/REQ-\d{3,}/)[0]]);
+  const files = (step.devFiles ?? [devFile]).map((f) => `\`${f}\``).join(", ");
+  const dev = reqs.map(([, r], i) => `- [ ] DEV-${pad(first + i)} (${r}) build ${r}. Files: ${files}.`);
+  const qa = reqs.map(([, r], i) => `- [ ] QA-${pad(first + i)} (${r}) check ${r}`);
+  return {
+    dev: `# Development TODO\n\n## Acceptance\n${reqs.map(([l]) => l).join("\n")}\n\n## Do not build\n${[...items("Out of scope", "OUT"), ...items("Not now", "LATER")].join("\n")}\n\n## Cautions\n${items("Cautions", "CAUTION").join("\n")}\n\n## Approach\nBuild it in ${devFile}.\n\n## TODO\n${dev.join("\n")}\n\n## Open questions\n- None\n`,
+    qa: `# QA TODO\n\n## Checks\n${qa.join("\n")}\n`,
+  };
 }

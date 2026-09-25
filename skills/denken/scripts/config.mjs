@@ -16,7 +16,7 @@
 //                           (default: true for stark and genau, false for the others; reviewers never)
 //       providers           comma-separated list of providers DENKEN may use
 //       allowSameReviewer   true lets the same provider, model and effort check its own work
-//       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin
+//       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits
 //
 // Files, later ones override earlier ones. Run from the project root.
 //   ~/.config/denken/config.json   --global  personal defaults for every project
@@ -29,7 +29,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SUPPORTED = ["claude", "codex"];
-export const DEFAULT_LIMITS = { topicRepeats: 3, roundsPerStage: 5, callTimeoutMin: 60 };
+export const DEFAULT_LIMITS = { topicRepeats: 3, roundsPerStage: 5, callTimeoutMin: 60, parallelUnits: 3 };
 const WORKER = { plan: "methode", dev: "stark", wiki: "serie" };
 const REVIEWER = { plan: "richter", dev: "ubel", wiki: "frieren" };
 const ROLES = ["methode", "stark", "serie", "richter", "ubel", "frieren", "genau"];
@@ -217,7 +217,7 @@ function show(json) {
   console.log(`Config:    ${r.sources?.length ? r.sources.join(" + ") : "defaults (no config file yet)"}`);
   if (r.stages) {
     console.log(`Mode:      ${r.crossProvider ? "cross-provider" : "single-provider"}`);
-    console.log(`Limits:    DENKEN steps in when a topic is raised ${r.limits.topicRepeats} times, the loop stalls, or a stage reaches ${r.limits.roundsPerStage} rounds; each call times out after ${r.limits.callTimeoutMin} min\n`);
+    console.log(`Limits:    DENKEN steps in when a topic is raised ${r.limits.topicRepeats} times, the loop stalls, or a stage reaches ${r.limits.roundsPerStage} rounds; each call times out after ${r.limits.callTimeoutMin} min; at most ${r.limits.parallelUnits} units work at once\n`);
     const row = (a, b, c) => console.log(`  ${a.padEnd(5)} ${b.padEnd(28)} ${c}`);
     row("stage", "worker", "reviewer / runner");
     for (const [stage, role] of Object.entries(WORKER)) {
@@ -276,7 +276,7 @@ function main() {
   const paths = configPaths();
   const target = args.includes("--global") ? paths.global : args.includes("--local") ? paths.local : paths.shared;
   const [command, key, value] = args.filter((a) => !a.startsWith("--"));
-  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin`;
+  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits`;
 
   if (!command) return show(args.includes("--json"));
   if (command === "init") {

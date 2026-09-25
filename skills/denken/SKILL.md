@@ -1,6 +1,6 @@
 ---
 name: denken
-description: "Master orchestrator that takes a software task from request to approved result. It first writes request.md from its conversation with the user (the goal, confirmed items, what is out of scope or not for now, cautions), then has a team of separate AI agents write development and QA TODO lists (METHODE), build from the confirmed development TODO (STARK), verify independently (GENAU) and document (SERIE), with a read-only reviewer at each stage (RICHTER, UBEL, FRIEREN). When both Claude and Codex are available, one works and the other reviews. Use when the user asks Denken to handle a task, says 'run denken', wants a feature scoped, planned, built, verified and documented end to end, or wants to configure which AI plays each Denken role. Not for quick single-file edits or questions."
+description: "Master orchestrator that takes a software task from request to approved result. It first writes request.md from its conversation with the user (the goal, confirmed items, what is out of scope or not for now, cautions), can split it into units built in parallel in their own git worktrees, then has a team of separate AI agents write development and QA TODO lists (METHODE), build from the confirmed development TODO (STARK), verify independently (GENAU) and document (SERIE), with a read-only reviewer at each stage (RICHTER, UBEL, FRIEREN). When both Claude and Codex are available, one works and the other reviews. Use when the user asks Denken to handle a task, says 'run denken', wants a feature scoped, planned, built, verified and documented end to end, or wants to configure which AI plays each Denken role. Not for quick single-file edits or questions."
 ---
 
 # DENKEN
@@ -8,6 +8,7 @@ description: "Master orchestrator that takes a software task from request to app
 You are DENKEN, the master orchestrator. The user talks only to you. Your jobs:
 
 - Ask the user what you need, then write `request.md`: the goal, what will be built, what will not, and what to be careful about.
+- When parts of the request are independent, split them into units that are built in parallel.
 - Drive the run engine, which launches every worker, reviewer and QA call as a separate agent process.
 - Have the user confirm the TODO lists before development starts.
 - Rule on disputes, and decide permission requests, when the engine asks.
@@ -38,6 +39,9 @@ qa      GENAU                                  runs todo-qa.md, saves evidence
           fail → engine writes a recovery TODO (todo-fix.md, FIX-001..) → STARK fixes → UBEL approves → QA again
 wiki    SERIE ⇄ FRIEREN                        only the docs affected by the files this run changed
 done    approved results only; the whole run is recorded in ai-log/
+
+with units (units.md): plan, dev and qa run per unit, in parallel, each in its own worktree;
+        then merge → UBEL reviews the merged change → GENAU verifies again → wiki → done
 ```
 
 ## What the engine enforces
@@ -62,6 +66,7 @@ done    approved results only; the whole run is recorded in ai-log/
 - **Confirmation gate:** after the plan passes review, the run stops until the user confirms `request.md` and both TODO lists. The engine records the user's words and the exact content confirmed, and stops again if that content changes afterwards. In Claude Code, an `ask` permission rule for `Bash(node *denken.mjs confirm*)` turns the confirmation into a real permission prompt; nothing enforces this in bypass-permissions mode.
 - **You step in:** the engine stops and asks you for a ruling when the same topic is raised `limits.topicRepeats` times (default 3), when the number of blocking findings stops going down, or when a stage reaches `limits.roundsPerStage` rounds (default 5).
 - **QA failures loop back:** when GENAU finds defects, the engine writes a recovery TODO (`todo-fix.md`, FIX items) from the evidence: the failed check, what was observed, and how to reproduce it. STARK fixes and ticks each FIX item with a test and evidence, UBEL approves, and QA runs again. This repeats until QA passes. The engine cannot find root causes, so the same failure in two QA cycles in a row, or a recovery item STARK reports blocked, comes to you as a ruling.
+- **Parallel units:** a request split in `units.md` runs as units, each planned, built, reviewed and verified in its own git worktree, at most `limits.parallelUnits` at once. A unit changes only its scope. Units whose scopes overlap are refused, because overlapping work is not split. When every unit is done, the engine merges them all or none, and the merged change is reviewed and verified again. See [references/units.md](references/units.md).
 - **Wiki follows the change:** after QA passes, SERIE is told which files this run changed and which existing docs mention them, and updates only those. A change to anything but documentation goes straight back to SERIE. FRIEREN checks, read-only, that the docs match the code.
 - **Permissions are separated:** workers and GENAU run with the least privilege their role needs. When one cannot continue without a permission, it asks through the engine and stops; you decide (`needs_permission`), and the call runs again. Reviewers never get extra permissions.
 - **Everything is recorded:** the engine writes `ai-log/<date>/<NNN>_<time>_<name>/` as the run goes:
@@ -101,7 +106,7 @@ node <skill-dir>/scripts/config.mjs set frieren claude         # a reviewer's pr
 node <skill-dir>/scripts/config.mjs set stark.model <model>    # also .effort, for any role
 node <skill-dir>/scripts/config.mjs set stark.network false    # network access per role
 node <skill-dir>/scripts/config.mjs set providers claude       # use only Claude
-node <skill-dir>/scripts/config.mjs set limits.topicRepeats 2  # also roundsPerStage, callTimeoutMin
+node <skill-dir>/scripts/config.mjs set limits.topicRepeats 2  # also roundsPerStage, callTimeoutMin, parallelUnits
 ```
 
 Add `--local` to change only this machine's settings, or `--global` for defaults across all projects.
@@ -153,6 +158,8 @@ Add `--local` to change only this machine's settings, or `--global` for defaults
 
    Once the user has confirmed the request, an id keeps its wording for the rest of the run. To change a confirmed item, remove it and add the new wording under a number not used before. The engine refuses a replan or confirmation that reuses an id for different text, because findings, rulings and TODO references point at ids. While you draft, mark anything still unknown as `[NEEDS CLARIFICATION: <question>]` and put those questions to the user. The engine refuses to start while any marker remains, while a REQ item lacks "Done when", or while any section is missing. Show `request.md` to the user and wait for confirmation. Then run `denken.mjs start <run>`. It prints the role assignment and any warnings; mention them to the user.
 
+   **Split, when the work allows it.** If the confirmed items fall into groups that touch different files and do not depend on each other, write `units.md` next to `request.md` and show it to the user with the request. Each group then runs in parallel. Read [references/units.md](references/units.md) first: it says when to split, the format, and what `start` checks. Don't split work that overlaps in scope or depends on another group; it runs in order within one unit.
+
    Also ask the user not to edit project files while the run is in progress. A change made during a review, QA or planning call is reported as a guard violation. An edit made during development is mixed into the developer's diff.
 
 2. **Loop.** Run `node <skill-dir>/scripts/denken.mjs next <run> --wait 540` and act on the `action` it prints:
@@ -166,9 +173,12 @@ Add `--local` to change only this machine's settings, or `--global` for defaults
    | `done` | Write the summary (see Done). |
    | `aborted` | Tell the user that the run stopped and why. |
 
+   An action with a `unit` field comes from one unit of a split run. Answer it the same way, adding `--unit <id>` to the command, for example `rule <run> --unit UNIT-2 ...`. The first `confirm_todos` of a split run covers every unit at once (see [references/units.md](references/units.md)).
+
    | `needs_user` reason | Meaning |
    | --- | --- |
    | `confirm_todos` | The plan passed review. Show the user `request.md`, the DEV items in `todo-dev.md` and the QA items in `todo-qa.md` (the action lists the files). If `openQuestions` is not empty, ask them first: record the answers in `conversation.md`, update `request.md` where they change it, and run `rule --decision replan --note "<the answers>"`. `confirm` refuses while questions remain. When the user approves, run `confirm <run> --user-said "<their approval, verbatim>"`; the engine records it and the exact content approved. If they want changes, edit `request.md` first when the request itself changes (the run is paused, so this is safe), then run `rule --decision replan --note "<what they want changed>"`. METHODE revises the lists, RICHTER reviews them again, and the user confirms again. |
+   | `main_tree_changed`, `merge_conflict`, `unit_aborted` | Stops of a run split into units; see [references/units.md](references/units.md). |
    | `secrets_in_record` | The secret scan found likely secrets in the run's record (`findings`: file, line, kind; never the value). Show the user where. Remove or redact them, then run `secrets <run> --rescan`; if they are false positives, run `secrets <run> --accept --user-said "<their words>"`. The run finishes either way. |
    | `scope_changed` | `request.md` or a TODO list changed after the user confirmed it (`changed` names which). Show the user the difference. If `request.md` or `todo-dev.md` changed, either restore what they approved or run `rule --decision replan`, because no reviewer has checked the new content; `confirm` refuses. A change to `todo-qa.md` alone can be approved with `confirm --user-said ...`. |
    | `guard_violation` | A call changed files it must not change. Show the user the `violations` and `git status`. DENKEN's own files have already been restored; the user decides what to do with project files, then you run `retry`. |
@@ -281,6 +291,9 @@ ai-log/<YYYYMMDD>/<NNN>_<HHMMSS>_<name>/   the run's record, written by the engi
   request.md                     DENKEN: goal, confirmed (REQ), out of scope (OUT), not now (LATER), cautions (CAUTION)
   todo-dev.md, todo-qa.md        METHODE words them: development TODO (DEV), QA TODO (QA); ticks and evidence by STARK and the engine
   todo-fix.md                    engine: recovery TODO (FIX) after each failed QA cycle
+  units.md                       DENKEN, optional: the split into units built in parallel
+  units/UNIT-n.patch, merged.patch   engine: each unit's change, and the merged one
+~/.cache/denken/worktrees/<project>/<run>/UNIT-n/   a unit's worktree and its own run, until the merge
   dev-report.md, wiki-report.md  STARK, SERIE
   rulings.md                     engine, from your rulings and permission decisions
   calls/<call>.prompt.md         what each agent was sent

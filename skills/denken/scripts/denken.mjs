@@ -26,7 +26,8 @@
 // Run from the project root.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig } from "./config.mjs";
@@ -77,6 +78,17 @@ function git(...args) {
   return r.status === 0 ? r.stdout : Buffer.alloc(0);
 }
 const gitText = (...args) => git(...args).toString("utf8").trim();
+
+// Git in a given directory for the work on units (worktrees, patches, the base commit), with the
+// same protections, and with every filter driver in the repository config switched off: a unit's
+// agents share the repository's .git, so a driver there is not trusted to run.
+function gitAt(dir, args, { env = {}, input } = {}) {
+  const drivers = new Set(gitText("config", "--get-regexp", "^filter\\.").split("\n").map((l) => l.match(/^filter\.(.+)\.[^.\s]+\s/)?.[1]).filter(Boolean));
+  const off = [...drivers].flatMap((d) => ["-c", `filter.${d}.clean=`, "-c", `filter.${d}.smudge=`, "-c", `filter.${d}.process=`, "-c", `filter.${d}.required=false`]);
+  const safe = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...off, ...(args[0] === "diff" ? ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args)];
+  const r = spawnSync("git", safe, { cwd: dir, env: { ...process.env, ...env }, input, maxBuffer: 1 << 30 });
+  return { ok: r.status === 0, out: r.stdout ?? Buffer.alloc(0), err: (r.stderr ?? "").toString("utf8").trim() };
+}
 
 function listFiles(dir) {
   if (!existsSync(dir)) return [];
@@ -272,6 +284,220 @@ function reusedIds(runDir, state) {
   return requestItems(runDir)
     .filter((i) => i.key in confirmed && confirmed[i.key] !== contract(i.text))
     .map((i) => `${i.key} now reads differently from what the user confirmed. Ids are never reused: restore ${i.key}, or remove it and add the new wording under a number not used before`);
+}
+
+// ---------- units: one request built in parallel
+// units.md, DENKEN's optional split of the request into units that are built at the same time:
+//   - UNIT-1 (REQ-001, REQ-002) <title>. Scope: `src/a/`, `test/a/`.
+// Each unit gets its own git worktree and runs plan, dev (with review) and QA there; when every
+// unit is done, the engine merges them and verifies the whole again. Work whose scope or
+// dependencies overlap is not split: it belongs in one unit, where its items run in order.
+const UNITS = "units.md";
+const MAX_UNITS = 9;
+function parseUnits(text) {
+  const units = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*[-*]\s*[*_`]*(UNIT-(\d+))\b[*_`]*\s*\(([^)]*)\)\s*(.*)$/);
+    if (!m) continue;
+    const [, id, n, refs, rest] = m;
+    const scopeText = rest.match(/\bScope:\s*(.*)$/i)?.[1] ?? "";
+    units.push({
+      id,
+      n: Number(n),
+      reqs: refs.match(/\bREQ-\d{3,}\b/g) ?? [],
+      title: rest.replace(/\bScope:.*$/i, "").trim().replace(/[.\s]+$/, ""),
+      scope: [...scopeText.matchAll(/`([^`]+)`/g)].map((x) => x[1].trim()),
+    });
+  }
+  return units;
+}
+// A scope entry is a directory ("src/a/", or a name without an extension) or a file.
+const scopeDir = (entry) => entry.endsWith("/") || !/\.\w+$/.test(basename(entry));
+const inScope = (scope, file) => scope.some((e) => (scopeDir(e) ? file.startsWith(`${e.replace(/\/$/, "")}/`) : file === e));
+const scopesOverlap = (a, b) => {
+  const x = a.replace(/\/$/, "");
+  const y = b.replace(/\/$/, "");
+  return x === y || y.startsWith(`${x}/`) || x.startsWith(`${y}/`);
+};
+function unitsProblems(runDir) {
+  const units = parseUnits(readRunFile(runDir, UNITS));
+  const problems = [];
+  if (units.length < 2) return { units, problems: [`${UNITS} needs at least two units to split the work; without it, the request runs as one`] };
+  if (units.length > MAX_UNITS) problems.push(`${UNITS} has ${units.length} units; at most ${MAX_UNITS}`);
+  const reqs = parseRequest(readRunFile(runDir, REQUEST)).REQ.items.map((i) => i.key);
+  units.forEach((u, i) => {
+    if (u.n !== i + 1) problems.push(`number the units in order from UNIT-1 (found ${u.id} in place ${i + 1})`);
+    if (!u.reqs.length) problems.push(`${u.id} names no REQ items`);
+    if (!u.title) problems.push(`${u.id} needs a title`);
+    if (!u.scope.length) problems.push(`${u.id} needs a scope: the paths it may change, as \`src/a/\`, \`test/a/\``);
+    for (const e of u.scope) if (/^\/|(^|\/)\.\.(\/|$)|[*?[\]{}]/.test(e) || !e.trim()) problems.push(`${u.id}: scope "${e}" must be a plain path inside the project, without globs`);
+    for (const r of u.reqs) if (!reqs.includes(r)) problems.push(`${u.id} names ${r}, which request.md does not define`);
+  });
+  for (const r of reqs) {
+    const owners = units.filter((u) => u.reqs.includes(r)).map((u) => u.id);
+    if (owners.length !== 1) problems.push(owners.length ? `${r} is in ${owners.join(" and ")}; each REQ item belongs to exactly one unit` : `${r} is in no unit`);
+  }
+  for (let i = 0; i < units.length; i++) {
+    for (let j = i + 1; j < units.length; j++) {
+      for (const a of units[i].scope) for (const b of units[j].scope) {
+        if (scopesOverlap(a, b)) problems.push(`${units[i].id} and ${units[j].id} overlap at ${a === b ? a : `${a} and ${b}`}: work whose scope overlaps is not split. Put it in one unit, where its items run in order`);
+      }
+    }
+  }
+  return { units, problems };
+}
+
+// Units are built in git worktrees outside the project, so the project's own tools (test
+// runners, tsc, linters) never pick them up, and each unit's agents are confined to their own.
+const WORKTREES = process.env.DENKEN_WORKTREES || join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "denken", "worktrees");
+// Dependencies installed in the project, linked one level above the units' worktrees, where
+// module resolution finds them and git in the worktree does not see them.
+const SHARED_DEPS = ["node_modules"];
+
+// The commit every unit starts from: the project as it is now, uncommitted and untracked files
+// included, built with plumbing (a temporary index, write-tree, commit-tree), so no hook runs and
+// no branch, index or working file of the project changes.
+function unitBaseCommit(runDir) {
+  const head = gitText("rev-parse", "-q", "--verify", "HEAD");
+  if (!head) fail("parallel units start from a commit: commit once, or remove units.md to run the request as one");
+  const index = join(runDir, "base.index");
+  rmSync(index, { force: true });
+  const env = { GIT_INDEX_FILE: index, GIT_AUTHOR_NAME: "DENKEN", GIT_AUTHOR_EMAIL: "denken@localhost", GIT_COMMITTER_NAME: "DENKEN", GIT_COMMITTER_EMAIL: "denken@localhost" };
+  const steps = [["read-tree", head], ["add", "-A", "--", ".", ...EXCLUDE]];
+  for (const step of steps) {
+    const r = gitAt(ROOT, step, { env });
+    if (!r.ok) fail(`could not record the project for the units (git ${step[0]}): ${r.err}`);
+  }
+  const tree = gitAt(ROOT, ["write-tree"], { env }).out.toString("utf8").trim();
+  const commit = gitAt(ROOT, ["-c", "commit.gpgSign=false", "commit-tree", tree, "-p", head, "-m", `DENKEN base for ${basename(runDir)}`], { env });
+  rmSync(index, { force: true });
+  if (!commit.ok) fail(`could not record the project for the units: ${commit.err}`);
+  return commit.out.toString("utf8").trim();
+}
+function addWorktree(path, commit) {
+  mkdirSync(dirname(path), { recursive: true });
+  const r = gitAt(ROOT, ["worktree", "add", "--detach", path, commit]);
+  if (!r.ok) fail(`git worktree add failed for ${path}: ${r.err}`);
+  // A locked worktree survives "git worktree prune" while its unit works in it.
+  gitAt(ROOT, ["worktree", "lock", "--reason", "DENKEN unit in progress", path]);
+}
+function removeWorktree(path) {
+  if (existsSync(path)) gitAt(ROOT, ["worktree", "remove", "--force", "--force", path]);
+  rmSync(path, { recursive: true, force: true });
+}
+
+// A unit's request.md: the request narrowed to the unit's REQ items, with everything that bounds
+// it (out of scope, not now, cautions) and a Unit section: its scope, its numbers, and the units
+// built beside it.
+function unitRequest(runDir, unit, units) {
+  const text = readRunFile(runDir, REQUEST);
+  const r = parseRequest(text);
+  const list = (prefix) => r[prefix].items.map((i) => i.text).join("\n") || "- None";
+  const scope = unit.scope.map((e) => `\`${e}\``).join(", ");
+  const others = units.filter((u) => u.id !== unit.id).map((u) => `  - ${u.id} (${u.reqs.join(", ")}) ${u.title}. Scope: ${u.scope.map((e) => `\`${e}\``).join(", ")}.`);
+  const decisions = section(text, "Decisions")?.trim();
+  return [
+    `# Request: ${text.match(/^#\s+(?:Request:\s*)?(.*)$/m)?.[1]?.trim() ?? "task"} · ${unit.id}: ${unit.title}`,
+    "",
+    "## Goal",
+    r.goal.trim(),
+    "",
+    `This run builds ${unit.id} of that goal, "${unit.title}", while other units are built at the same time.`,
+    "",
+    "## Confirmed",
+    r.REQ.items.filter((i) => unit.reqs.includes(i.key)).map((i) => i.text).join("\n"),
+    "",
+    "## Out of scope",
+    list("OUT"),
+    "",
+    "## Not now",
+    list("LATER"),
+    "",
+    "## Cautions",
+    list("CAUTION"),
+    "",
+    "## Unit",
+    `- ${unit.id}: ${unit.title}.`,
+    `- Scope: ${scope}. Change files only there: a change anywhere else goes back to STARK. If an item cannot be done inside the scope, say so under Open questions, and DENKEN will change the split.`,
+    `- Number this unit's items from ${unit.n * 100 + 1}: DEV-${unit.n * 100 + 1}, QA-${unit.n * 100 + 1}, and so on.`,
+    "- Built by other units at the same time, not by this one:",
+    ...others,
+    ...(decisions ? ["", "## Decisions", decisions] : []),
+    "",
+  ].join("\n");
+}
+
+// The parent's fields every run needs, for a new run or a unit's.
+function runFields(assignment, baseRef) {
+  return {
+    assignment,
+    baseRef,
+    round: { plan: 0, dev: 0, qa: 0, wiki: 0 },
+    stageBase: {},
+    counts: { plan: {}, dev: {}, wiki: {} },
+    findings: { plan: [], dev: [], wiki: [] },
+    history: { plan: [], dev: [], wiki: [] },
+    historyBase: {},
+    capBase: {},
+    dismissed: {},
+    ruled: {},
+    denialStreak: {},
+    lastReview: {},
+    lastWork: {},
+    lastQa: null,
+    devInput: null,
+    deferred: [],
+    rulings: [],
+    approved: { plan: null, dev: null, qa: null, wiki: null },
+    calls: [],
+    inflight: null,
+    blocked: null,
+    retryCall: null,
+  };
+}
+
+// One worktree and one run per unit, all from the same base commit. The parent keeps where each
+// unit lives: commands for a unit go through the parent (--unit), never by what the unit's own
+// files claim.
+function createUnits(runDir, state, units) {
+  const home = join(WORKTREES, `${slug(basename(ROOT))}-${sha(ROOT).slice(0, 8)}`, basename(runDir));
+  tearDownUnits(state);
+  rmSync(home, { recursive: true, force: true });
+  mkdirSync(home, { recursive: true });
+  for (const dep of SHARED_DEPS) {
+    if (existsSync(join(ROOT, dep)) && gitAt(ROOT, ["check-ignore", "-q", dep]).ok) symlinkSync(join(ROOT, dep), join(home, dep));
+  }
+  const base = unitBaseCommit(runDir);
+  state.unitHome = home;
+  state.unitBase = base;
+  state.units = units.map((u) => {
+    const root = join(home, u.id);
+    addWorktree(root, base);
+    const run = join(root, ".denken", "runs", basename(runDir));
+    mkdirSync(join(run, "calls"), { recursive: true });
+    if (!existsSync(join(root, ".denken", ".gitignore"))) writeFileSync(join(root, ".denken", ".gitignore"), "*\n");
+    writeFileSync(join(run, REQUEST), unitRequest(runDir, u, units));
+    const child = { version: 1, task: `${state.task} · ${u.id}`, created: now(), log: logDir(state), verdicts: [], unit: u.id, title: u.title, mainRoot: ROOT, idBase: u.n * 100, scope: u.scope, ...runFields(state.assignment, base) };
+    enterStage(child, "plan");
+    logRequest(child, run);
+    timeline(child, "DENKEN", `${u.id} (${u.reqs.join(", ")}) "${u.title}" starts in its own worktree; scope ${u.scope.join(", ")}`);
+    save(run, child);
+    return { id: u.id, n: u.n, title: u.title, reqs: u.reqs, scope: u.scope, root: realpathSync(root), run: realpathSync(run), started: false, status: "queued", last: null, pulled: 0 };
+  });
+  state.mainPrint = projectPrint(runDir);
+}
+function tearDownUnits(state) {
+  for (const u of state.units ?? []) removeWorktree(u.root);
+  if (state.unitHome) removeWorktree(join(state.unitHome, "INTEGRATION"));
+  gitAt(ROOT, ["worktree", "prune"]);
+}
+
+// The project as the units found it: tracked, untracked and ignored files and agent
+// configuration, without DENKEN's own run and record. It must not change while units work.
+function projectPrint(runDir) {
+  const s = snapshot(runDir, "", null);
+  const mine = `${relative(ROOT, runDir)}/`;
+  return sha(JSON.stringify([s.project, s.ignored, Object.entries(s.owned).filter(([f]) => !f.startsWith(mine))]));
 }
 
 const ITEM = {
@@ -526,6 +752,45 @@ function namesFile(evidence, file) {
   return forms.some((n) => new RegExp(`(^|[^\\w./-])${esc(n)}(?=$|[^\\w./-]|\\.(?:$|\\s))`).test(evidence));
 }
 
+// A unit's plan stays inside its numbers and its scope.
+function unitPlanGaps(runDir, state) {
+  if (!state.unit) return [];
+  const gaps = [];
+  const gap = (identity, file, todo, problem, required_change) => gaps.push({ identity, severity: "blocking", topic: identity, file, line_start: null, line_end: null, request_item: null, todo, problem, required_change, source: "engine" });
+  const lo = state.idBase + 1;
+  const hi = state.idBase + 99;
+  for (const [file, prefix] of [[TODO_DEV, "DEV"], [TODO_QA, "QA"]]) {
+    for (const i of parseItems(readRunFile(runDir, file), prefix).items) {
+      const n = Number(i.key.split("-")[1]);
+      if (n < lo || n > hi) gap(`todo-range-${i.key}`, file, i.key, `${i.key} is outside ${state.unit}'s numbers`, `Number ${state.unit}'s items from ${prefix}-${lo} to ${prefix}-${hi}.`);
+    }
+  }
+  for (const d of parseItems(readRunFile(runDir, TODO_DEV), "DEV").items) {
+    const outside = namedPaths(d).filter((p) => !inScope(state.scope, p));
+    if (outside.length) gap(`todo-scope-${d.key}`, TODO_DEV, d.key, `${d.key} names ${outside.join(", ")}, outside ${state.unit}'s scope (${state.scope.join(", ")})`, "Keep the item inside the scope. If it cannot be done without changing those files, say so under Open questions: DENKEN will change the split.");
+  }
+  return gaps;
+}
+// The files a DEV item names: its "Files:" list, and paths in backticks. A name counts when it
+// exists in the project, or its folder does (a new file); code such as `text.length` does not.
+function namedPaths(item) {
+  const text = item.block.split("\n").filter((l) => !EVIDENCE_LINE.test(l)).join(" ");
+  const listed = (text.match(/\bFiles:\s*(.*?)(?:\.\s+[A-Z]|\bUnit tests:|$)/)?.[1] ?? "").split(/[\s,;()]+/);
+  const quoted = [...text.matchAll(/`([^`\s]+)`/g)].map((m) => m[1]).filter((t) => t.includes("/"));
+  return [...new Set([...listed, ...quoted].map((t) => t.replace(/^[`'"]+|[`'".:]+$/g, "")))]
+    .filter((t) => /^[\w@.\/-]+$/.test(t) && !t.startsWith("/") && !t.includes("..") && (t.includes("/") || /\.\w+$/.test(t)))
+    .filter((t) => existsSync(join(ROOT, t)) || (dirname(t) !== "." && existsSync(join(ROOT, dirname(t)))));
+}
+// A unit changes only files in its scope: anything else could collide with another unit.
+function unitScopeGaps(state) {
+  if (!state.unit) return [];
+  return stageChanges(state, "dev").changed.filter((f) => !inScope(state.scope, f)).map((f) => ({
+    identity: `scope-${f}`, severity: "blocking", topic: `scope-${f}`, file: f, line_start: null, line_end: null, request_item: null, todo: null, source: "engine",
+    problem: `${f} changed, outside ${state.unit}'s scope (${state.scope.join(", ")})`,
+    required_change: `Undo the change to ${f}. If an item cannot be done without it, report the item blocked in dev-report.md with the reason: DENKEN will change the split.`,
+  }));
+}
+
 function devGaps(runDir, state, rejected = []) {
   const report = readRunFile(runDir, "dev-report.md");
   const items = [
@@ -731,7 +996,10 @@ const LOG_DIRS = ["00-request", ...Object.values(STAGE_LOG), "raw"];
 const clock = () => new Date().toTimeString().slice(0, 8);
 const pad = (n, width) => String(n).padStart(width, "0");
 const oneLine = (text, max = 200) => String(text ?? "").replace(/\s+/g, " ").trim().slice(0, max);
-const logDir = (state) => (state.log ? join(ROOT, state.log) : null);
+// A unit's run keeps the parent's record, by absolute path, and writes into a folder of its own
+// within each part of it: 01-planning/UNIT-1/, raw/UNIT-1/, and so on.
+const logDir = (state) => (state.log ? resolve(ROOT, state.log) : null);
+const logPart = (state, part) => (state.unit ? join(part, state.unit) : part);
 
 function createLog(name) {
   const d = new Date();
@@ -754,7 +1022,7 @@ function createLog(name) {
 
 function timeline(state, actor, text) {
   const dir = logDir(state);
-  if (dir) appendFileSync(join(dir, "timeline.md"), `- ${clock()} · **${actor}** · ${text}\n`);
+  if (dir) appendFileSync(join(dir, "timeline.md"), `- ${clock()} · **${state.unit ? `${state.unit} · ` : ""}${actor}** · ${text}\n`);
 }
 
 // verdicts.md: one line per submission or verdict, with the words it was given in. The lines live
@@ -770,8 +1038,10 @@ function verdict(state, label, who, word, text, { call = null, file = null, note
   writeVerdicts(state, `- ${clock()} · ${label} · ${who}${call ? ` · ${call}` : ""} · **${word}**${note ? ` (${note})` : ""} · ${shown}${shown.length < full.length ? " … (truncated)" : ""}${file ? ` → ${file}` : ""}`);
 }
 function writeVerdicts(state, line) {
-  const path = join(logDir(state), "verdicts.md");
   state.verdicts ??= [];
+  // A unit's lines are pulled into the parent's verdicts.md by the parent, the file's only writer.
+  if (state.unit) return state.verdicts.push(line);
+  const path = join(logDir(state), "verdicts.md");
   if (state.verdictsSha && hashFile(path) !== state.verdictsSha) {
     const kept = `raw/verdicts.changed-${new Date().toISOString().replace(/\D/g, "").slice(0, 14)}.md`;
     if (existsSync(path)) copyFileSync(path, join(logDir(state), kept));
@@ -788,12 +1058,13 @@ function writeVerdicts(state, line) {
 function logStep(state, stage, name, content) {
   const dir = logDir(state);
   if (!dir) return null;
-  const folder = join(dir, STAGE_LOG[stage]);
+  const part = logPart(state, STAGE_LOG[stage]);
+  const folder = join(dir, part);
   mkdirSync(folder, { recursive: true });
   const n = readdirSync(folder).filter((f) => /^\d{2}_/.test(f)).length + 1;
   const file = `${pad(n, 2)}_${name}.md`;
   writeFileSync(join(folder, file), content);
-  return `${STAGE_LOG[stage]}/${file}`;
+  return `${part}/${file}`;
 }
 
 // Copies everything a call exchanged (prompt, job, streamed log, output, gaps, ticks, ...) to raw/.
@@ -801,12 +1072,14 @@ function logRaw(state, runDir, callId) {
   const dir = logDir(state);
   if (!dir) return;
   state.rawSeq = (state.rawSeq ?? 0) + 1;
+  const raw = join(dir, logPart(state, "raw"));
+  mkdirSync(raw, { recursive: true });
   for (const f of readdirSync(join(runDir, "calls"))) {
     const path = join(runDir, "calls", f);
     if (!f.startsWith(`${callId}.`)) continue;
-    if (statSync(path).isFile()) copyFileSync(path, join(dir, "raw", `${pad(state.rawSeq, 3)}_${f}`));
+    if (statSync(path).isFile()) copyFileSync(path, join(raw, `${pad(state.rawSeq, 3)}_${f}`));
     else if (f.endsWith(".tampered")) for (const t of listFiles(path)) {
-      const target = join(dir, "raw", `${pad(state.rawSeq, 3)}_${f}`, relative(path, t));
+      const target = join(raw, `${pad(state.rawSeq, 3)}_${f}`, relative(path, t));
       mkdirSync(dirname(target), { recursive: true });
       copyFileSync(t, target);
     }
@@ -818,7 +1091,9 @@ function logRaw(state, runDir, callId) {
 function logRequest(state, runDir) {
   const dir = logDir(state);
   if (!dir) return;
-  copyFileSync(join(runDir, REQUEST), join(dir, "00-request", "request.md"));
+  mkdirSync(join(dir, logPart(state, "00-request")), { recursive: true });
+  copyFileSync(join(runDir, REQUEST), join(dir, logPart(state, "00-request"), "request.md"));
+  if (existsSync(join(runDir, UNITS)) && !state.unit) copyFileSync(join(runDir, UNITS), join(dir, "00-request", UNITS));
   if (existsSync(join(runDir, "conversation.md"))) copyFileSync(join(runDir, "conversation.md"), join(dir, "raw", "000_conversation.md"));
 }
 
@@ -882,7 +1157,7 @@ function renderWork(runDir, state, call, provider, facts) {
 function logQa(state, runDir, call, items, facts) {
   const dir = logDir(state);
   if (!dir) return;
-  const folder = join(dir, STAGE_LOG.qa, `qa-${call.round}`);
+  const folder = join(dir, logPart(state, STAGE_LOG.qa), `qa-${call.round}`);
   mkdirSync(join(folder, "evidence"), { recursive: true });
   const evidence = join(runDir, "calls", `${call.id}.evidence`);
   if (existsSync(evidence)) for (const f of listFiles(evidence)) {
@@ -993,6 +1268,9 @@ function buildCall(runDir, state, call) {
     }
     if (lastReview) read.push(lastReview);
     if (call.stage === "dev") extra.push(`Scope facts computed by the engine:\n  ${scopeReport(runDir, state)}`);
+    if (call.stage === "dev" && state.devInput === "merge") {
+      extra.push(`This is the merged result of units built in parallel, each already reviewed on its own: ${state.units.map((u) => `${u.id} "${u.title}" (${u.reqs.join(", ")}, in ${u.scope.join(", ")})`).join("; ")}. Review what no unit's reviewer could see: how the units fit together. Look for duplicated helpers, inconsistent names or APIs, conflicting assumptions, and a change in one unit that breaks another.`);
+    }
     if (call.stage === "wiki") {
       extra.push(`Code changed in this run: ${(state.runChanges ?? []).filter((f) => !isDoc(f)).join(", ") || "none"}.\n  Docs changed in this stage: ${stageChanges(state, "wiki").changed.join(", ") || "none"}.\n  Read the code each changed doc describes, and check that the description matches it. Flag docs changed for no reason related to these changes.`);
     }
@@ -1008,6 +1286,7 @@ function buildCall(runDir, state, call) {
     if (denials.length) extra.push(`The worker had ${denials.length} action(s) blocked by permissions in its last call. Check that nothing the work depends on was skipped:\n${denials.map((d) => `  - ${d.tool}: ${JSON.stringify(d.input).slice(0, 200)}`).join("\n")}`);
   } else {
     read.push(p(REQUEST), p(TODO_QA));
+    if (state.units) extra.push(`This is the check after the merge: ${state.units.map((u) => u.id).join(", ")} were built in parallel, each verified on its own, then merged. Run every item against the merged product, starting with QA-001, the whole test suite.`);
     extra.push(`Save the evidence for each item as files in ${callBase(runDir, call.id)}.evidence/ (command output, logs, and screenshots when there is a UI), and list each item's files in evidence_files.`);
   }
   if (existsSync(p("rulings.md"))) read.push(p("rulings.md"));
@@ -1028,6 +1307,7 @@ function buildCall(runDir, state, call) {
     "",
     `- Stage: ${call.stage}, round ${call.round}. You run on ${agent.provider}${agent.model ? ` (${agent.model})` : ""}.`,
     `- Project root: ${ROOT}`,
+    ...(state.unit ? [`- Unit: ${state.unit} (${state.title}). Scope: ${state.scope.join(", ")}. This is the unit's own worktree; other units are built in parallel in theirs.`] : []),
     `- Run directory: ${runDir}`,
     `- Read:\n${read.map((f) => `  - ${f}`).join("\n")}`,
   ];
@@ -1071,7 +1351,9 @@ function launch(runDir, state) {
   const timeoutMs = Math.round(state.assignment.limits.callTimeoutMin * 60000);
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
   if (call.mode === "qa") mkdirSync(`${base}.evidence`, { recursive: true });
-  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.log ?? null, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
+  // A unit's record lives in the parent's ai-log, outside the unit's worktree, where siblings
+  // write too: the unit's guard covers its worktree, and Claude is denied the main checkout.
+  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
   state.inflight = { ...call, provider: agent.provider, started: now() };
   timeline(state, `${call.role.toUpperCase()} (${agent.provider})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}`);
   state.calls.push({ id: call.id, mode: call.mode, provider: agent.provider, model: agent.model, attempt: call.attempt, started: state.inflight.started });
@@ -1177,7 +1459,11 @@ async function execCall(runDir, id) {
         args.push("--disallowedTools", "WebFetch,WebSearch");
         if (job.mode === "work") args.push("--strict-mcp-config");
       }
-      args.push("--settings", JSON.stringify({ sandbox }));
+      // The sandbox bounds Bash; Claude's own file tools are bounded by permission rules. A unit's
+      // agents may not edit the main checkout, which holds the other units' record.
+      // "//" makes the rule path absolute; a single "/" would be relative to the settings source.
+      const permissions = job.protect ? { deny: ["Edit", "Write", "NotebookEdit"].map((tool) => `${tool}(/${job.protect}/**)`) } : undefined;
+      args.push("--settings", JSON.stringify({ sandbox, ...(permissions ? { permissions } : {}) }));
       for (const dir of grants.dirs) args.push("--add-dir", dir);
       if (grants.tools.length) args.push("--allowedTools", grants.tools.join(","));
     }
@@ -1314,24 +1600,28 @@ function enterStage(state, stage) {
 
 // The last verdict, and the digest of the finished verdicts.md, kept in the timeline and state.
 function finish(state) {
+  if (state.unit) return verdict(state, "Unit", "ENGINE", "DONE", "planned, built, reviewed and verified on its own; it is merged when every unit is done");
   verdict(state, "Done", "ENGINE", "DONE", "every stage approved");
   timeline(state, "ENGINE", `verdicts.md sha256: ${state.verdictsSha}`);
 }
+// A unit ends with its own QA: the docs are written once, for the merged result.
+const nextStageOf = (state, stage) => (state.unit && stage === "qa" ? "done" : NEXT_STAGE[stage]);
 
 function approve(state, stage, evidence) {
   state.approved[stage] = evidence;
+  const next = nextStageOf(state, stage);
   // The record is tracked in the project, so likely secrets in it stop the run before DONE.
-  if (NEXT_STAGE[stage] === "done") {
+  if (next === "done" && !state.unit) {
     state.secretFindings = scanSecrets(state);
     if (state.secretFindings.length) {
       timeline(state, "ENGINE", `secret scan: ${state.secretFindings.length} possible secret(s) in the record (${[...new Set(state.secretFindings.map((h) => h.file))].slice(0, 5).join(", ")})`);
       return block(state, "user", { reason: "secrets_in_record", resolveWith: "secrets", stage, findings: state.secretFindings });
     }
   }
-  timeline(state, "ENGINE", NEXT_STAGE[stage] === "done" ? "DONE: every stage approved" : `${stage} approved → ${NEXT_STAGE[stage]}`);
-  if (NEXT_STAGE[stage] === "done") finish(state);
+  timeline(state, "ENGINE", next === "done" ? (state.unit ? "DONE: planned, built, reviewed and verified; waiting for the merge" : "DONE: every stage approved") : `${stage} approved → ${next}`);
+  if (next === "done") finish(state);
   if (stage === "dev") state.devInput = null;
-  enterStage(state, NEXT_STAGE[stage]);
+  enterStage(state, next);
   // Development starts only after the user has confirmed the scope and both TODO lists.
   if (stage === "plan") block(state, "user", { reason: "confirm_todos", resolveWith: "confirm", stage: "plan" });
 }
@@ -1453,7 +1743,7 @@ function ingest(runDir, state, meta) {
     // back to METHODE, and DEV items STARK neither ticked off nor reported blocked go straight
     // back to STARK, as an engine round, without spending a review on them.
     if (stage === "plan" || stage === "dev" || stage === "wiki") {
-      const gaps = stage === "plan" ? todoGaps(runDir) : stage === "dev" ? devGaps(runDir, state, rejectedTicks) : wikiGaps(state);
+      const gaps = stage === "plan" ? [...todoGaps(runDir), ...unitPlanGaps(runDir, state)] : stage === "dev" ? [...devGaps(runDir, state, rejectedTicks), ...unitScopeGaps(state)] : wikiGaps(state);
       if (gaps.length) {
         const gapsPath = `${base}.gaps.json`;
         const checked = { plan: "engine check of the TODO lists against request.md", dev: "engine check of the TODO items' ticks and recorded test runs", wiki: "engine check that only documentation changed" }[stage];
@@ -1505,8 +1795,8 @@ function ingest(runDir, state, meta) {
     logQa(state, runDir, call, items, meta.facts);
     const summary = output.summary ?? (failing.length ? failing.map((c) => `${c.id} failed`).join(", ") : "all checks passed");
     const agreed = (output.result === "PASS") === !failing.length;
-    verdict(state, `Independent QA, cycle ${call.round}`, `GENAU (${call.provider})`, failing.length ? "FAILED" : "PASSED", summary, { call: call.id, file: `${STAGE_LOG.qa}/qa-${call.round}/report.md`, note: agreed ? null : `GENAU's result: ${output.result}; ${failing.length} failing item(s) after dismissals and missing items` });
-    timeline(state, who, failing.length ? `FAILED QA cycle ${call.round}: ${failing.map((c) => c.id).join(", ")} → ${STAGE_LOG.qa}/qa-${call.round}/` : `PASSED QA cycle ${call.round} (${items.length} checks) → ${STAGE_LOG.qa}/qa-${call.round}/`);
+    verdict(state, `Independent QA${state.units ? " after the merge" : ""}, cycle ${call.round}`, `GENAU (${call.provider})`, failing.length ? "FAILED" : "PASSED", summary, { call: call.id, file: `${logPart(state, STAGE_LOG.qa)}/qa-${call.round}/report.md`, note: agreed ? null : `GENAU's result: ${output.result}; ${failing.length} failing item(s) after dismissals and missing items` });
+    timeline(state, who, failing.length ? `FAILED QA cycle ${call.round}: ${failing.map((c) => c.id).join(", ")} → ${logPart(state, STAGE_LOG.qa)}/qa-${call.round}/` : `PASSED QA cycle ${call.round} (${items.length} checks) → ${logPart(state, STAGE_LOG.qa)}/qa-${call.round}/`);
     if (failing.length === 0) return approve(state, "qa", outPath);
     // Back to dev with a recovery TODO the engine writes from the QA evidence: STARK sees what
     // broke and how to reproduce it, not the QA TODO list. The dev stage's diff base is kept, so
@@ -1552,6 +1842,7 @@ function ingest(runDir, state, meta) {
 
   // review
   state.lastReview[stage] = outPath;
+  const mergedReview = stage === "dev" && state.devInput === "merge";
   if (stage === "dev") state.devInput = "review";
   // The stage's outcome is the engine's: blocking findings still open after DENKEN's dismissals.
   // When the reviewer's own verdict says otherwise, the record says both.
@@ -1563,7 +1854,7 @@ function ingest(runDir, state, meta) {
   const note = said === word ? null : `reviewer's verdict: ${said}; ${open.length} open blocking finding(s)${raised.length > open.length ? `, ${raised.length - open.length} already dismissed by DENKEN` : ""}`;
   const file = logStep(state, stage, `${call.role}-${word.toLowerCase()}-round${call.round}`, renderFindings(`${who} · ${stage} review, round ${call.round} · ${call.provider}`, output, { word, note }) + renderFacts(meta.facts));
   timeline(state, who, `${open.length ? `REJECTED (${open.length} blocking): ${oneLine(open[0].problem, 120)}` : "APPROVED"}${note ? ` (${note})` : ""}${factsBrief(meta.facts)} → ${file}`);
-  verdict(state, `${STAGE_NAME[stage]} review, round ${call.round}`, `${who} (${call.provider})`, word, output.summary ?? (open.length ? open[0].problem : "no findings"), { call: call.id, file, note });
+  verdict(state, `${STAGE_NAME[stage]} review${mergedReview ? " of the merged units" : ""}, round ${call.round}`, `${who} (${call.provider})`, word, output.summary ?? (open.length ? open[0].problem : "no findings"), { call: call.id, file, note });
   if (recordReview(state, stage, call, output.findings) === 0) approve(state, stage, outPath);
 }
 
@@ -1589,7 +1880,24 @@ function actionFor(runDir, state) {
   if (state.stage === "done") {
     return { action: "done", run: relative(ROOT, runDir), log: state.log, verdictsSha256: state.verdictsSha, secrets: state.secretFindings ?? [], approved: state.approved, deferred: state.deferred.length, rulings: state.rulings.length, crossProvider: state.assignment.crossProvider, warnings: state.assignment.warnings, next: "Write summary.md from state.json and report to the user." };
   }
-  if (state.stage === "aborted") return { action: "aborted", run: relative(ROOT, runDir), rulings: state.rulings.length };
+  if (state.stage === "aborted") return { action: "aborted", run: relative(ROOT, runDir), rulings: state.rulings.length, ...(state.units ? { worktrees: state.units.filter((u) => existsSync(u.root)).map((u) => u.root) } : {}) };
+  if (state.blocked && state.stage === "units") {
+    const b = state.blocked;
+    const run = relative(ROOT, runDir);
+    if (b.reason === "confirm_todos") {
+      return {
+        action: "needs_user", ...b, run,
+        units: state.units.map((u) => ({ unit: u.id, title: u.title, reqs: u.reqs, scope: u.scope, files: [REQUEST, TODO_DEV, TODO_QA].map((f) => join(u.run, f)), openQuestions: u.last?.openQuestions ?? [] })),
+        next: `Every unit has planned and passed its planning review. Show the user ${UNITS} and each unit's request.md and TODO lists. If they approve, run confirm ${run} --user-said '<their approval, verbatim>'. To change one unit's lists, run rule ${run} --unit <id> --decision replan --note '<the change>'. To change the split, edit ${UNITS} (and request.md), then run rule ${run} --decision replan --note '<why>'.`,
+      };
+    }
+    const next = {
+      main_tree_changed: `The project changed while the units were working, and they are merged into it. Show the user the status. When the project is as it should be, run retry ${run}; or abort with rule ${run} --decision abort.`,
+      merge_conflict: `The units' changes did not apply together (${b.unit}). Show the user the error and the patch. Run retry ${run} after the cause is fixed, or rule ${run} --decision abort.`,
+      unit_aborted: `${b.unit} was aborted, so the units cannot be merged. Ask the user, then run rule ${run} --decision abort, or rule ${run} --decision replan while the units wait for their first confirmation.`,
+    }[b.reason];
+    return { action: "needs_user", ...b, run, units: unitsSummary(state), next: next ?? "Tell the user, then run retry or rule --decision abort." };
+  }
   if (state.blocked) {
     const b = state.blocked;
     if (b.kind === "ruling") {
@@ -1621,6 +1929,16 @@ async function next(runDir, waitSec) {
   for (;;) {
     const state = load(runDir);
     if (state.stage === "intake") fail("the run has not started; write request.md, confirm it with the user, then run start");
+    // Units: step them all, and come back with whatever needs DENKEN. The confirmation gate is
+    // re-checked on every step, since DENKEN may replan a unit while the others wait there.
+    if (state.stage === "units" && (!state.blocked || state.blocked.reason === "confirm_todos")) {
+      const shown = await stepUnits(runDir, state, deadline);
+      logStop(state);
+      assertLock();
+      save(runDir, state);
+      if (shown === "merged") continue;
+      return print(shown ?? actionFor(runDir, state));
+    }
     if (["done", "aborted"].includes(state.stage) || state.blocked) return print(actionFor(runDir, state));
     if (state.inflight) {
       // Wait on the call's own files only. state.json is not re-read until the call has
@@ -1679,6 +1997,230 @@ async function next(runDir, waitSec) {
   }
 }
 
+// ---------- the parent of units
+// The parent steps each unit's run in the unit's worktree (next --wait 0), keeping at most
+// limits.parallelUnits of them working at once, and brings DENKEN whatever a unit needs. A unit
+// is queued (not started), working (a call runs), waiting (blocked on DENKEN or the user), ready
+// (unblocked, waiting for a free slot), done, or aborted.
+function stepUnit(u) {
+  const r = spawnSync(process.execPath, [SCRIPT, "next", u.run, "--wait", "0"], { cwd: u.root, encoding: "utf8", maxBuffer: 1 << 26 });
+  try {
+    return JSON.parse(r.stdout);
+  } catch {
+    return { action: "error", error: `${u.id}'s engine printed no result (exit ${r.status}): ${oneLine(r.stderr, 400)}` };
+  }
+}
+const readUnit = (u) => {
+  try {
+    return JSON.parse(readFileSync(join(u.run, "state.json"), "utf8"));
+  } catch {
+    return null;
+  }
+};
+// A unit's verdict lines, pulled into the parent's verdicts.md with the unit's name after the time.
+function pullVerdicts(state) {
+  for (const u of state.units) {
+    const lines = readUnit(u)?.verdicts ?? [];
+    for (const line of lines.slice(u.pulled ?? 0)) writeVerdicts(state, line.replace(/^- (\d{2}:\d{2}:\d{2}) · /, `- $1 · ${u.id} · `));
+    u.pulled = Math.max(u.pulled ?? 0, lines.length);
+  }
+}
+function unitAction(runDir, u) {
+  const run = relative(ROOT, runDir);
+  return { ...u.last, unit: u.id, unitTitle: u.title, run, next: `${u.last.next ?? ""} This is ${u.id}'s: run the command on this run with --unit ${u.id} (for example: rule ${run} --unit ${u.id} --decision ...). The other units keep working; run next again to move them on.`.trim() };
+}
+const unitsSummary = (state) => state.units.map((u) => ({ unit: u.id, status: u.status, ...(u.last?.reason ? { reason: u.last.reason } : {}), ...(u.last?.call ? { call: u.last.call } : {}) }));
+
+async function stepUnits(runDir, state, deadline) {
+  const limit = state.assignment.limits.parallelUnits ?? 3;
+  for (;;) {
+    let busy = state.units.filter((u) => u.status === "working").length;
+    for (const u of state.units) {
+      if (u.status === "done" || u.status === "aborted") continue;
+      // A unit DENKEN has since unblocked is ready again, and needs a free slot like any other.
+      if (u.status === "waiting" && (u.last?.action === "error" || readUnit(u)?.blocked?.since !== u.last?.since)) u.status = "ready";
+      if (u.status === "waiting" || (u.status !== "working" && busy >= limit)) continue;
+      const was = u.status;
+      u.started = true;
+      u.last = stepUnit(u);
+      u.status = u.last.action === "done" ? "done" : u.last.action === "aborted" ? "aborted" : u.last.action === "running" ? "working" : "waiting";
+      busy += (u.status === "working") - (was === "working");
+    }
+    pullVerdicts(state);
+    // The units are merged into the project as it was when they started, so it must not change.
+    if (projectPrint(runDir) !== state.mainPrint) {
+      block(state, "user", { reason: "main_tree_changed", resolveWith: "retry", stage: "units", status: gitText("status", "--short", "--", ".", ...EXCLUDE).split("\n").filter(Boolean).slice(0, 20) });
+      return null;
+    }
+    const aborted = state.units.find((u) => u.status === "aborted");
+    if (aborted) {
+      block(state, "user", { reason: "unit_aborted", resolveWith: "rule", stage: "units", unit: aborted.id });
+      return null;
+    }
+    // Before the first confirmation, every unit's TODO lists are confirmed together.
+    const gate = (u) => !state.unitsConfirmed && u.last?.reason === "confirm_todos";
+    const needs = state.units.find((u) => u.status === "waiting" && !gate(u));
+    if (needs) {
+      if (state.blocked?.reason === "confirm_todos") state.blocked = null;
+      return unitAction(runDir, needs);
+    }
+    if (!state.unitsConfirmed && state.units.every((u) => u.status === "waiting" && gate(u))) {
+      if (state.blocked?.reason !== "confirm_todos") block(state, "user", { reason: "confirm_todos", resolveWith: "confirm", stage: "units" });
+      return null;
+    }
+    if (state.units.every((u) => u.status === "done")) return mergeUnits(runDir, state);
+    if (Date.now() >= deadline) return { action: "running", units: unitsSummary(state), next: "Run next again with --wait." };
+    assertLock();
+    save(runDir, state);
+    await sleep(Math.min(2000, Math.max(0, deadline - Date.now())));
+  }
+}
+
+// Every unit is done: merge them all, or none. The units' patches (each against the common base,
+// so commits an agent made are included) are applied together in an integration worktree first;
+// only the combined patch that results is applied to the project.
+function mergeUnits(runDir, state) {
+  const integration = join(state.unitHome, "INTEGRATION");
+  removeWorktree(integration);
+  addWorktree(integration, state.unitBase);
+  const dir = join(runDir, "units");
+  mkdirSync(dir, { recursive: true });
+  const conflict = (unit, patch, error) => {
+    block(state, "user", { reason: "merge_conflict", resolveWith: "retry", stage: "units", unit, patch, error: oneLine(error, 800) });
+    return null;
+  };
+  const merged = [];
+  for (const u of state.units) {
+    gitAt(u.root, ["add", "-A", "--", ".", ...EXCLUDE]);
+    const patch = gitAt(u.root, ["diff", "--cached", "--binary", state.unitBase, "--", ".", ...EXCLUDE]).out;
+    const files = gitAt(u.root, ["diff", "--cached", "--name-only", state.unitBase, "--", ".", ...EXCLUDE]).out.toString("utf8").split("\n").filter(Boolean);
+    const committed = gitAt(u.root, ["rev-parse", "HEAD"]).out.toString("utf8").trim() !== state.unitBase;
+    const path = join(dir, `${u.id}.patch`);
+    writeFileSync(path, patch);
+    merged.push({ unit: u.id, files, committed });
+    if (!patch.length) continue;
+    const check = gitAt(integration, ["apply", "--check", "--binary", path]);
+    if (!check.ok) return conflict(u.id, path, check.err);
+    gitAt(integration, ["apply", "--binary", path]);
+  }
+  gitAt(integration, ["add", "-A", "--", "."]);
+  const combined = gitAt(integration, ["diff", "--cached", "--binary", state.unitBase, "--", "."]).out;
+  const all = join(dir, "merged.patch");
+  writeFileSync(all, combined);
+  if (projectPrint(runDir) !== state.mainPrint) {
+    block(state, "user", { reason: "main_tree_changed", resolveWith: "retry", stage: "units", status: gitText("status", "--short", "--", ".", ...EXCLUDE).split("\n").filter(Boolean).slice(0, 20) });
+    return null;
+  }
+  // The project before the merge is where the merged change is measured from.
+  const base = gitText("stash", "create") || gitText("rev-parse", "-q", "--verify", "HEAD") || EMPTY_TREE;
+  const untracked = gitText("ls-files", "--others", "--exclude-standard", "--", ".", ...EXCLUDE).split("\n").filter(Boolean);
+  if (combined.length) {
+    const check = gitAt(ROOT, ["apply", "--check", "--binary", all]);
+    if (!check.ok) return conflict("all", all, check.err);
+    const applied = gitAt(ROOT, ["apply", "--binary", all]);
+    if (!applied.ok) return conflict("all", all, applied.err);
+  }
+  state.stageBase.dev = base;
+  (state.stageEnteredAt ??= {}).dev = now();
+  (state.untrackedAtStage ??= {}).dev = untracked;
+  composeMerged(runDir, state);
+  state.confirmed = { at: now(), userSaid: state.unitsConfirmed?.userSaid ?? null, hashes: confirmedHashes(runDir), units: true };
+  // The units' own records are already in the ai-log; keep each unit's final state beside them.
+  const log = logDir(state);
+  for (const u of state.units) {
+    mkdirSync(join(log, "raw", u.id), { recursive: true });
+    if (existsSync(join(u.run, "state.json"))) copyFileSync(join(u.run, "state.json"), join(log, "raw", u.id, "state.json"));
+    copyFileSync(join(dir, `${u.id}.patch`), join(log, "raw", u.id, "merge.patch"));
+  }
+  const step = logStep(state, "dev", "engine-merge", `# Merge of the units\n\nEvery unit was planned, built, reviewed and verified in its own worktree. Their changes were applied together in an integration worktree, then to the project as one patch.\n\n${merged.map((m) => `## ${m.unit}${m.committed ? " (its agent committed; the commits are included)" : ""}\n\n${m.files.map((f) => `- ${f}`).join("\n") || "No changes."}`).join("\n\n")}\n`);
+  verdict(state, "Merge", "ENGINE", "MERGED", `${merged.map((m) => `${m.unit} (${m.files.length} file(s))`).join(", ")} merged into the project; UBEL now reviews the merged change, then GENAU verifies it again`, { file: step });
+  timeline(state, "ENGINE", `merged ${merged.map((m) => `${m.unit} (${m.files.length} file(s))`).join(", ")} → ${step}`);
+  tearDownUnits(state);
+  rmSync(state.unitHome, { recursive: true, force: true });
+  try {
+    if (!readdirSync(dirname(state.unitHome)).length) rmSync(dirname(state.unitHome), { recursive: true });
+  } catch {}
+  state.unitsMerged = now();
+  state.stage = "dev";
+  state.pending = "review";
+  state.round.dev = 1;
+  state.devInput = "merge";
+  state.approved.plan = "units";
+  return "merged";
+}
+
+// The merged TODO lists and report, from the units': every DEV item as ticked, with its
+// evidence; every QA item unticked, to be verified again; and QA-001, the whole test suite.
+function composeMerged(runDir, state) {
+  const r = parseRequest(readRunFile(runDir, REQUEST));
+  const copies = (prefixes) => prefixes.flatMap((p) => r[p].items.map((i) => i.text)).join("\n") || "- None";
+  const part = (u, file, heading) => (section(readRunFile(u.run, file), heading) ?? "").trim();
+  const byUnit = (file, heading, shape = (x) => x) => state.units.map((u) => `### ${u.id}: ${u.title}\n\n${shape(part(u, file, heading)) || "- None"}`).join("\n\n");
+  writeFileSync(join(runDir, TODO_DEV), `# Development TODO (merged)\n\nThe units' development TODO lists, merged. Each unit was built, reviewed and verified in its own worktree.\n\n## Acceptance\n${copies(["REQ"])}\n\n## Do not build\n${copies(["OUT", "LATER"])}\n\n## Cautions\n${copies(["CAUTION"])}\n\n## Approach\n${byUnit(TODO_DEV, "Approach")}\n\n## TODO\n${byUnit(TODO_DEV, "TODO")}\n\n## Open questions\n- None\n`);
+  writeFileSync(join(runDir, TODO_QA), `# QA TODO (merged)\n\n## Checks\n- [ ] QA-001 (${r.REQ.items.map((i) => i.key).join(", ")}) The project's whole test suite passes on the merged result. How: run the project's full test command. Expected: every test passes.\n\n${byUnit(TODO_QA, "Checks", planText)}\n`);
+  writeFileSync(join(runDir, "dev-report.md"), `# Development report (merged)\n\n${state.units.map((u) => `## ${u.id}: ${u.title}\n\n${readRunFile(u.run, "dev-report.md").replace(/^#[^\n]*\n/, "").trim() || "(none)"}`).join("\n\n")}\n`);
+}
+
+function confirmUnits(runDir, state, userSaid) {
+  if (state.blocked?.reason !== "confirm_todos") fail("nothing to confirm: the units are not all waiting for confirmation; run next");
+  const questions = state.units.flatMap((u) => (u.last?.openQuestions ?? []).map((q) => `${u.id}: ${q}`));
+  if (questions.length) fail(`cannot confirm while units have open questions: ${questions.join("; ")}. Ask the user, then replan those units with rule --unit <id> --decision replan.`);
+  const failed = [];
+  for (const u of state.units) {
+    const r = spawnSync(process.execPath, [SCRIPT, "confirm", u.run, "--user-said", userSaid], { cwd: u.root, encoding: "utf8" });
+    let out = null;
+    try {
+      out = JSON.parse(r.stdout);
+    } catch {}
+    if (out?.action !== "confirmed") failed.push(`${u.id}: ${out?.error ?? oneLine(r.stderr, 300)}`);
+  }
+  // Units that were confirmed go ahead; any that were not are then confirmed one by one.
+  if (failed.length < state.units.length) {
+    state.unitsConfirmed = { at: now(), userSaid };
+    state.blocked = null;
+    timeline(state, "USER via DENKEN", `confirmed the units' TODO lists: "${oneLine(userSaid, 140)}"`);
+    timeline(state, "RESUME", "the units start development");
+  }
+  assertLock();
+  save(runDir, state);
+  if (failed.length) fail(`not confirmed: ${failed.join("; ")}`);
+  print({ action: "confirmed", units: state.units.map((u) => u.id), next: "Development starts in every unit. Run next with --wait." });
+}
+
+// A unit's run is stopped when the run it belongs to is aborted or split again.
+function abortUnits(state) {
+  for (const u of state.units ?? []) {
+    if (u.status !== "done" && existsSync(u.run)) spawnSync(process.execPath, [SCRIPT, "_abort", u.run], { cwd: u.root, encoding: "utf8" });
+    u.status = u.status === "done" ? "done" : "aborted";
+  }
+}
+
+function ruleUnits(runDir, state, decision, note) {
+  const id = `R${state.rulings.length + 1}`;
+  const reason = state.blocked?.reason ?? "units";
+  if (decision === "replan") {
+    if (state.blocked?.reason !== "confirm_todos" || state.unitsConfirmed) fail("the split can change only while every unit waits for the first confirmation; to replan one unit, use --unit <id>");
+    const problems = [...requestProblems(readRunFile(runDir, REQUEST)), ...unitsProblems(runDir).problems];
+    if (problems.length) fail(`fix request.md and ${UNITS} before splitting again: ${problems.join("; ")}`);
+    abortUnits(state);
+    createUnits(runDir, state, unitsProblems(runDir).units);
+    logRequest(state, runDir);
+    state.blocked = null;
+  } else if (decision === "abort") {
+    abortUnits(state);
+    state.stage = "aborted";
+    state.blocked = null;
+  } else fail("for the whole split, the decisions are replan (a new split) or abort; to rule on one unit, add --unit <id>");
+  state.rulings.push({ id, stage: "units", subject: "the split", reason, decision, at: now() });
+  const ruling = logStep(state, "plan", `denken-ruling-${id}-${decision}`, `# DENKEN · ruling ${id} · ${decision}\n\nOn: the split into units\n\n${note.trim()}\n`);
+  timeline(state, "DENKEN", `ruling ${id} (${decision}) on the split: ${oneLine(note, 140)} → ${ruling}`);
+  verdict(state, `Ruling ${id} on the split`, "DENKEN", decision.toUpperCase(), note, { file: ruling });
+  appendFileSync(join(runDir, "rulings.md"), `${state.rulings.length === 1 ? "# Rulings\n\n" : ""}## ${id} · units · the split · ${decision}\n\n${note.trim()}\n\n`);
+  assertLock();
+  save(runDir, state);
+  print({ action: "ruled", id, decision, stage: state.stage, ...(decision === "abort" ? { worktrees: state.units.map((u) => u.root) } : { units: state.units.map((u) => u.id) }), next: decision === "abort" ? "Tell the user the run was aborted. The units' worktrees are kept for inspection." : "Run next with --wait." });
+}
+
 // ---------- commands
 
 function cmdNew(name) {
@@ -1713,43 +2255,25 @@ function cmdStart(runDir) {
     print({ action: "needs_user", reason: "same_reviewer", stages: config.sameReviewer, next: "The same model would check its own work. Ask the user: set a different reviewer (richter, ubel, frieren) or genau model or effort with config.mjs, or set allowSameReviewer true. Then run start again." });
     process.exit(1);
   }
-  Object.assign(state, {
-    assignment: { crossProvider: config.crossProvider, sameReviewer: config.sameReviewer, stages: config.stages, limits: config.limits, warnings: config.warnings },
-    baseRef: gitText("rev-parse", "-q", "--verify", "HEAD") || null,
-    round: { plan: 0, dev: 0, qa: 0, wiki: 0 },
-    stageBase: {},
-    counts: { plan: {}, dev: {}, wiki: {} },
-    findings: { plan: [], dev: [], wiki: [] },
-    history: { plan: [], dev: [], wiki: [] },
-    historyBase: {},
-    capBase: {},
-    dismissed: {},
-    ruled: {},
-    denialStreak: {},
-    lastReview: {},
-    lastWork: {},
-    lastQa: null,
-    devInput: null,
-    deferred: [],
-    rulings: [],
-    approved: { plan: null, dev: null, qa: null, wiki: null },
-    calls: [],
-    inflight: null,
-    blocked: null,
-    retryCall: null,
-  });
-  enterStage(state, "plan");
+  const split = existsSync(join(runDir, UNITS)) ? unitsProblems(runDir) : null;
+  if (split?.problems.length) fail(`${UNITS}: ${split.problems.join("; ")}`);
+  Object.assign(state, runFields({ crossProvider: config.crossProvider, sameReviewer: config.sameReviewer, stages: config.stages, limits: config.limits, warnings: config.warnings }, gitText("rev-parse", "-q", "--verify", "HEAD") || null));
   logRequest(state, runDir);
   const roles = Object.entries(config.stages).map(([stage, s]) => Object.entries(s).map(([k, a]) => `${stage}.${k}=${a.provider}`).join(" ")).join(" · ");
   timeline(state, "DENKEN", `the user agreed the request; run started (${roles}) → 00-request/request.md`);
+  if (split) {
+    timeline(state, "DENKEN", `the request is split into ${split.units.length} units, built in parallel: ${split.units.map((u) => `${u.id} (${u.reqs.join(", ")}) in ${u.scope.join(", ")}`).join("; ")} → 00-request/${UNITS}`);
+    createUnits(runDir, state, split.units);
+    state.stage = "units";
+  } else enterStage(state, "plan");
   assertLock();
   save(runDir, state);
-  print({ action: "started", log: state.log, run: relative(ROOT, runDir), crossProvider: config.crossProvider, stages: config.stages, limits: config.limits, warnings: config.warnings, next: "Run next with --wait." });
+  print({ action: "started", log: state.log, run: relative(ROOT, runDir), units: state.units?.map((u) => ({ unit: u.id, reqs: u.reqs, scope: u.scope, worktree: u.root })) ?? null, crossProvider: config.crossProvider, stages: config.stages, limits: config.limits, warnings: config.warnings, next: "Run next with --wait." });
 }
 
 function cmdRule(runDir, args) {
   const state = load(runDir);
-  if (!state.blocked) fail("nothing to rule on: the run is not blocked");
+  if (!state.blocked && state.stage !== "units") fail("nothing to rule on: the run is not blocked");
   const decision = args[args.indexOf("--decision") + 1];
   if (!["uphold", "dismiss", "replan", "abort"].includes(decision)) fail("--decision must be uphold, dismiss, replan or abort");
   const noteIndex = args.indexOf("--note");
@@ -1757,6 +2281,7 @@ function cmdRule(runDir, args) {
   const note = noteIndex >= 0 ? args[noteIndex + 1] : fileIndex >= 0 ? readFileSync(args[fileIndex + 1], "utf8") : null;
   if (!note?.trim()) fail("a ruling needs --note <text> or --note-file <path> explaining the decision and the direction");
 
+  if (state.stage === "units") return ruleUnits(runDir, state, decision, note);
   const b = state.blocked;
   const stage = b.stage ?? state.stage;
   if (["confirm_todos", "scope_changed"].includes(b.reason) && !["replan", "abort"].includes(decision)) {
@@ -1822,6 +2347,15 @@ function cmdRetry(runDir) {
   const b = state.blocked;
   if (!b || b.kind !== "user") fail("nothing to retry: the run is not waiting on the user");
   if (b.resolveWith !== "retry") fail(`this block is resolved with ${b.resolveWith}, not retry`);
+  // Units: the project as it is now becomes what they are merged into, and the merge is tried again.
+  if (state.stage === "units") {
+    state.blocked = null;
+    state.mainPrint = projectPrint(runDir);
+    timeline(state, "DENKEN", `retry after ${b.reason}`);
+    assertLock();
+    save(runDir, state);
+    return print({ action: "resumed", next: "Run next with --wait." });
+  }
   state.blocked = null;
   const last = state.calls.findLast((c) => c.id === b.call);
   const [stage, role, round] = b.call.split("-");
@@ -1935,16 +2469,17 @@ async function acquireLock(runDir, waitMs) {
 
 function cmdConfirm(runDir, args) {
   const state = load(runDir);
-  if (!["confirm_todos", "scope_changed"].includes(state.blocked?.reason)) fail("nothing to confirm: the run is not waiting for TODO confirmation");
   const i = args.indexOf("--user-said");
   const userSaid = i >= 0 ? String(args[i + 1] ?? "").trim() : "";
   if (!userSaid) fail("record the user's approval: confirm <run> --user-said '<what they said, verbatim>'");
+  if (state.stage === "units") return confirmUnits(runDir, state, userSaid);
+  if (!["confirm_todos", "scope_changed"].includes(state.blocked?.reason)) fail("nothing to confirm: the run is not waiting for TODO confirmation");
   if (state.blocked.reason === "scope_changed") {
     const current = confirmedHashes(runDir);
     const reviewed = ["request", "todoDev"].filter((k) => current[k] !== state.confirmed.hashes[k]);
     if (reviewed.length) fail(`${reviewed.join(" and ")} changed since the user confirmed; no reviewer has checked the new content. Restore it, or run rule --decision replan.`);
   }
-  const problems = [...requestProblems(readRunFile(runDir, REQUEST)), ...reusedIds(runDir, state), ...todoGaps(runDir).map((g) => g.problem)];
+  const problems = [...requestProblems(readRunFile(runDir, REQUEST)), ...reusedIds(runDir, state), ...[...todoGaps(runDir), ...unitPlanGaps(runDir, state)].map((g) => g.problem)];
   if (problems.length) fail(`cannot confirm: ${problems.join("; ")}. Fix request.md and replan.`);
   const questions = openQuestions(runDir);
   if (questions.length) fail(`cannot confirm while todo-dev.md has open questions: ${questions.join("; ")}. Ask the user, write the answers into request.md, then replan.`);
@@ -2091,6 +2626,7 @@ function cmdStatus(runDir) {
     deferred: s.deferred?.length ?? 0,
     rulings: s.rulings?.map((r) => `${r.id} ${r.stage} ${r.subject} ${r.decision}`),
     calls: s.calls?.slice(-6).map((c) => `${c.id} ${c.provider} ${c.status ?? "running"}`),
+    ...(s.units ? { units: s.units.map((u) => ({ unit: u.id, status: u.status, stage: readUnit(u)?.stage ?? null, reason: u.last?.reason ?? null, worktree: existsSync(u.root) ? u.root : null })) } : {}),
   });
 }
 
@@ -2100,7 +2636,36 @@ const locked = async (fn) => {
   if (!(await acquireLock(runDir, 0))) fail("another DENKEN engine process is working on this run; wait for it, then try again");
   fn(runDir);
 };
+// A command for one unit goes through the parent run, which alone says where the unit lives.
+const unitAt = rest.indexOf("--unit");
+if (unitAt >= 0 && ["rule", "retry", "confirm", "grant", "deny", "status", "secrets"].includes(command)) {
+  const parent = load(runDirOf(runArg));
+  const u = (parent.units ?? []).find((x) => x.id === rest[unitAt + 1]);
+  if (!u) fail(`${rest[unitAt + 1] ?? "(none)"} is not a unit of this run${parent.units ? `; its units are ${parent.units.map((x) => x.id).join(", ")}` : ""}`);
+  if (!existsSync(u.run)) fail(`${u.id}'s worktree is gone: the units were merged, or the run was cleaned up`);
+  const r = spawnSync(process.execPath, [SCRIPT, command, u.run, ...rest.filter((_, i) => i !== unitAt && i !== unitAt + 1)], { cwd: u.root, stdio: "inherit" });
+  process.exit(r.status ?? 1);
+}
 switch (command) {
+  case "_abort": {
+    // Stops a unit's run: its call, if one is running, and the run itself.
+    const runDir = runDirOf(runArg);
+    if (!(await acquireLock(runDir, 15000))) fail("the unit's engine is busy");
+    const state = load(runDir);
+    if (state.inflight) {
+      const base = callBase(runDir, state.inflight.id);
+      await stopCallGroup(base, state.inflight.provider);
+      const pid = Number(existsSync(`${base}.pid`) ? readFileSync(`${base}.pid`, "utf8") : 0);
+      if (pid && pidAlive(pid)) signalGroup(pid, "SIGTERM");
+      state.inflight = null;
+    }
+    state.stage = "aborted";
+    state.blocked = null;
+    timeline(state, "ENGINE", "stopped: the run it belongs to was aborted or split again");
+    save(runDir, state);
+    print({ action: "aborted" });
+    break;
+  }
   case "new":
     cmdNew(runArg);
     break;

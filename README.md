@@ -19,7 +19,7 @@ npx skills add geonwoo-jeong/denken --skill <name> -g -a claude-code
 
 | Skill | Description |
 | ----- | ----------- |
-| [denken](skills/denken/SKILL.md) | Master orchestrator. Writes a request with you, has TODO lists written and confirmed, then builds, verifies and documents the work. Each stage is reviewed read-only by a different AI, and only approved results are delivered. |
+| [denken](skills/denken/SKILL.md) | Master orchestrator. Writes a request with you, can split it into units built in parallel, has TODO lists written and confirmed, then builds, verifies and documents the work. Each stage is reviewed read-only by a different AI, and only approved results are delivered. |
 
 ### The DENKEN team
 
@@ -33,6 +33,9 @@ qa      GENAU                 runs todo-qa.md and saves evidence
           fail → recovery TODO (todo-fix.md, FIX-001..) → STARK fixes → UBEL approves → QA again
 wiki    SERIE ⇄ FRIEREN       only the docs affected by the files this run changed
 done    approved results only; the whole run is recorded in ai-log/
+
+units   optional: independent parts of a request run plan, dev and qa in parallel, each in its
+        own git worktree; then merge → review of the merged change → QA again → wiki
 ```
 
 | Name | Role | Default provider |
@@ -58,6 +61,7 @@ How it works:
     Evidence: added normalHeightPx to QuickVizLocalPage.tsx, kept separate from the fullscreen height
   ```
 
+- **Parallel units:** DENKEN can split a request into units that touch different files and don't depend on each other (`units.md`). Each unit is planned, built, reviewed and verified in its own git worktree, at the same time as the others (up to `limits.parallelUnits`). When all are done, they are merged all or none, and the merged change is reviewed and verified again. Work that overlaps in scope or depends on other work is not split; it runs in order within one unit.
 - **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
 - **Permissions:** workers run with least privilege. One that needs more (network, a directory outside the project, a blocked command) asks through the engine and stops; DENKEN grants the minimum or denies it, and anything broad (all network, a directory outside the project) needs your explicit answer. Agent configuration (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`) and DENKEN's own files cannot be changed by any agent.
 - **Record:** every run is written to `ai-log/<date>/<NNN>_<time>_<name>/` as it goes: `00-request`, `01-planning`, `02-development`, `03-qa` (with evidence), `04-wiki`, `raw/` (every exchange), `timeline.md` (every step, verdict, stop and resume) and `verdicts.md` (every submission and verdict exchanged, READY, REJECTED, APPROVED, PASSED, in the words it was given). Raw exchanges and QA evidence are git-ignored by default, and a secret scan runs before DONE.

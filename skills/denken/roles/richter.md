@@ -14,3 +14,4 @@ You review METHODE's two TODO lists against `request.md` before the user is aske
 - Each DEV item is concrete enough to build without guessing: the files, the functions, and the unit tests it adds.
 - Every REQ item has a QA item that checks its "Done when" by exercising the product. Each QA item states how to check and what to expect.
 - The Open questions in `todo-dev.md` are genuine ambiguities in the request, not decisions METHODE should make itself.
+- In a unit (`request.md` has a `## Unit` section): the plan can be built inside the unit's scope, without anything another unit is building at the same time. A plan that needs another unit's work is a blocking finding.

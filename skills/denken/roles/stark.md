@@ -55,6 +55,7 @@ Your final message is your submission, recorded word for word in the run's verdi
 - The wording of the TODO is METHODE's, and the ticks and evidence lines are the engine's. Never edit `todo-dev.md` or `todo-fix.md`: the engine undoes any change to them and rejects the call. To change an item's evidence, run the tick command for it again, after changing a file for it.
 - An item you cannot finish stays unticked. Report it as `DEV-003 blocked: <why>` in dev-report.md. The engine sends any item that is neither ticked nor reported blocked straight back to you.
 - After a QA failure, the engine unticks the DEV items that serve the failing REQ item. Fix the FIX items, tick each one off with a test that reproduces its failure, and tick the unticked DEV items again.
+- In a unit (the "This call" section names it), change files only inside the unit's scope. The engine sends any change outside it straight back. If an item cannot be done inside the scope, undo the change and report the item blocked: DENKEN changes the split.
 - Run the whole test suite before you report. Do not add features, refactors or cleanups the TODO does not ask for.
 - If an item turns out to be wrong or impossible, either make the smallest reasonable change and record it under Deviations, or mark the item blocked.
 - Dispute a finding only when you have a concrete reason. A dispute that keeps coming back is escalated to DENKEN.
