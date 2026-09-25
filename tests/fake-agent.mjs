@@ -55,8 +55,8 @@ if (args[0] === "--version") {
 const system = args.includes("--append-system-prompt-file") ? readFileSync(args[args.indexOf("--append-system-prompt-file") + 1], "utf8") : "";
 const prompt = `${system}\n${readFileSync(0, "utf8")}`;
 const scenarioPath = process.env.FAKE_SCENARIO;
-// A re-warm of a seed: a fork with nothing to do.
-if (!/^# \w+:/m.test(prompt)) {
+// A re-warm of a seed: a fork with nothing to do. (A continued session names its role on a line.)
+if (!/^# \w+:/m.test(prompt) && !/^- Role: \w+/m.test(prompt)) {
   appendFileSync(`${scenarioPath}.log`, `${cli} rewarm\n`);
   appendFileSync(`${scenarioPath}.args.jsonl`, `${JSON.stringify({ key: "rewarm", attempt: 1, args })}\n`);
   const sessionId = args[args.indexOf("--session-id") + 1];
@@ -67,7 +67,7 @@ if (!/^# \w+:/m.test(prompt)) {
 }
 const scenario = JSON.parse(readFileSync(scenarioPath, "utf8"));
 
-const role = prompt.match(/^# (\w+):/m)[1].toLowerCase();
+const role = (prompt.match(/^# (\w+):/m) ?? prompt.match(/^- Role: (\w+)/m))[1].toLowerCase();
 // FLAMME's seed calls name the stage and the role they seed, not a round.
 const [, stage, round = "0"] = prompt.match(/- Stage: (\w+)(?:, round (\d+))?/);
 const seedFor = prompt.match(/^- Seed for: (\w+)/m)?.[1] ?? null;
@@ -201,7 +201,8 @@ if (cli === "claude") {
   console.log(JSON.stringify({ type: "result", is_error: false, result: text, structured_output: structured, session_id: sessionId, permission_denials: step.denials ?? [], usage, total_cost_usd: 0.01 }));
 } else {
   writeFileSync(args[args.indexOf("-o") + 1], text);
-  console.log(JSON.stringify({ type: "thread.started", thread_id: `thread-${key}` }));
+  // A resumed thread keeps its id; a new or forked one gets its own.
+  console.log(JSON.stringify({ type: "thread.started", thread_id: args[1] === "resume" ? args[2] : `thread-${key}` }));
 }
 
 // A passing answer for every QA item listed in todo-qa.md.

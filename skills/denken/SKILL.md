@@ -129,6 +129,8 @@ FLAMME, the seed AI, gets to know the project before the team's calls start: its
 - **No anchoring:** a checker's seed must answer in its call's schema, so it answers `CONTEXT_LOADED`, a placeholder that is never accepted as a result. The fork is told it is not a verdict.
 - **Failures:** a seed that changes a file is a guard violation. A fork that cannot start, for example because its seed is gone, runs once from scratch, and the timeline says so.
 
+**Sessions across rounds:** a worker's later rounds in a stage continue its own previous session, so it remembers what it did and why, and its cache still holds that. On Codex, whose cache is kept per session, this is the only reuse there is. A continued call is told what happened since its last call (items the engine unticked, new FIX items, rulings, the review). A session serves at most three rounds; after that the worker starts clean again, before the conversation crowds out the plan. It also starts clean after a second QA failure, so it does not keep defending work QA keeps rejecting, and after about an hour idle, when the cache has likely expired. Reviewers and GENAU never continue: each round judges the work as it is now, not anchored to its last verdict. A session that cannot be continued is started fresh, and the timeline says so.
+
 No DENKEN call runs the user's hooks (`disableAllHooks`): hooks for interactive sessions, such as a summary of past work or notifications, would only add context the role must not rely on.
 
 ## Levels: the model for each stage

@@ -390,15 +390,53 @@ const PERSPECTIVE = { work: "worker", review: "reviewer", qa: "qa" };
 // While METHODE plans, the development TODO is its own draft, not something to start from.
 const seedInputs = (perspective, stage) => ({ worker: stage === "plan" ? [] : [TODO_DEV], reviewer: [REQUEST], qa: [REQUEST, TODO_QA] })[perspective];
 const SEED_USE = { worker: "the workers who plan, build and document (METHODE, STARK, SERIE)", reviewer: "the reviewers who check plans, code and docs against the request (RICHTER, UBEL, FRIEREN)", qa: "GENAU, who verifies the product independently" };
+// What shapes a call's flags: a fork or a continued session must match them to reuse the cache.
+function profileOf(state, call, agent) {
+  const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
+  return [agent.provider, agent.model ?? null, agent.effort ?? null, call.mode, Boolean(agent.network), grants, state.mainRoot ?? null];
+}
+
+// ---------- workers continue their own session
+// A worker's next round in a stage continues its previous round's session: it remembers what it did
+// and why, and the cache still holds it (Codex keys its cache by session, so only this reuses it).
+// A session serves at most CONTINUE_ROUNDS rounds; then the worker starts clean again, before the
+// conversation grows long enough to crowd out the plan. Checkers never continue: each review and
+// QA round judges the work as it is now, not anchored to the verdict it gave last time.
+// A session is not continued when:
+// - its cache has likely expired: the whole grown conversation would be sent again, uncached, which
+//   costs more than a clean start;
+// - QA has failed again: the session holds its own case for the work QA keeps rejecting.
+const CONTINUE_ROUNDS = 3;
+function continueFor(state, call, agent) {
+  if (call.mode !== "work") return null;
+  const prev = state.workSessions?.[call.role];
+  const profile = sha(JSON.stringify(profileOf(state, call, agent)));
+  if (!prev || prev.stage !== call.stage || prev.profile !== profile || prev.epoch !== (state.seedEpoch ?? 0) || prev.chain >= CONTINUE_ROUNDS) return null;
+  if (Date.now() - Date.parse(prev.at) > SEED_REWARM_MS) return null;
+  if (call.stage === "dev" && state.devInput === "qa" && (state.currentFixCycle ?? 0) >= 2) return null;
+  return { sessionId: prev.sessionId, chain: prev.chain, from: prev.call, since: prev.at };
+}
+// What the engine and others did since the worker's session last ran, which its memory lacks.
+function sinceLastCall(runDir, state, call, since) {
+  const lines = [];
+  const unticked = Object.entries(state.unticked ?? {}).filter(([, u]) => u.at > since).map(([k, u]) => `${k} (after QA cycle ${u.cycle})`);
+  if (unticked.length) lines.push(`the engine unticked ${unticked.join(", ")}: QA failed for the request items they serve`);
+  for (const [cycle, c] of Object.entries(state.fixCycles ?? {})) if (c.at > since) lines.push(`QA cycle ${cycle} failed; the engine wrote ${c.items.join(", ")} to ${TODO_FIX}`);
+  if (call.stage === "dev") lines.push(`the engine wrote the ticks you recorded, with their evidence, into ${TODO_DEV}`);
+  for (const r of state.rulings ?? []) if (r.at > since) lines.push(`DENKEN's ruling ${r.id} (${r.decision}) on ${r.subject}: see rulings.md`);
+  const review = state.lastReview[call.stage];
+  if (review && existsSync(review) && statSync(review).mtime.toISOString() > since) lines.push(`a review of your last round came back; it is listed under Read`);
+  return lines;
+}
+
 // A seed is made again when what it read changes (ticks and evidence aside), and a Claude seed not
 // used for close to the cache's hour is re-warmed first: its prefix would no longer be cached.
 const SEED_REWARM_MS = 55 * 60000;
 function seedFor(runDir, state, call, agent) {
   if (!(state.seeding ?? []).includes(agent.provider)) return null;
   const perspective = PERSPECTIVE[call.mode];
-  const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
   const inputs = seedInputs(perspective, call.stage).map((f) => (f.startsWith("todo-") ? planText(readRunFile(runDir, f)) : readRunFile(runDir, f)));
-  const profile = sha(JSON.stringify([agent.provider, agent.model ?? null, agent.effort ?? null, call.mode, Boolean(agent.network), grants, state.mainRoot ?? null, inputs])).slice(0, 12);
+  const profile = sha(JSON.stringify([...profileOf(state, call, agent), inputs])).slice(0, 12);
   const key = `${perspective}#${state.seedEpoch ?? 0}#${profile}`;
   const known = state.seedSessions?.[key];
   const idle = known ? Date.now() - Date.parse(known.lastUsedAt ?? known.at) : 0;
@@ -1286,6 +1324,7 @@ function renderFacts(facts) {
     ["Cost", facts.costUsd != null ? `$${facts.costUsd.toFixed(4)}` : null],
     ["Level", facts.level],
     ["Seed", facts.seed],
+    ["Session", facts.continued],
     ["Model that ran", facts.modelRan],
     ["Tokens", facts.tokens ? `in ${facts.tokens.input ?? "?"} · out ${facts.tokens.output ?? "?"} · cache read ${facts.tokens.cacheRead ?? "?"}${facts.tokens.cacheWrite != null ? ` · cache write ${facts.tokens.cacheWrite}` : ""}` : null],
     ["HEAD", facts.head],
@@ -1457,6 +1496,7 @@ function buildCall(runDir, state, call) {
   const lines = [
     "## This call",
     "",
+    `- Role: ${call.role.toUpperCase()}`,
     `- Stage: ${call.stage}, round ${call.round}. You run on ${agent.provider}${agent.model ? ` (${agent.model})` : ""}.`,
     `- Project root: ${ROOT}`,
     ...(state.unit ? [`- Unit: ${state.unit} (${state.title}). Scope: ${state.scope.join(", ")}. This is the unit's own worktree; other units are built in parallel in theirs.`] : []),
@@ -1502,18 +1542,23 @@ function launch(runDir, state) {
     if (existsSync(base + suffix)) renameSync(base + suffix, `${base}.prev-${stamp}${suffix}`);
   }
   const seed = seedFor(runDir, state, call, agent);
+  const cont = continueFor(state, call, agent);
   writeFileSync(`${base}.system.md`, system);
   // A forked session keeps its seed's system prompt, so a seeded call's role goes in its message.
-  writeFileSync(`${base}.prompt.md`, seed ? `${system}\n---\n\n${prompt}- You start from the context FLAMME loaded (above), shared by every call of your kind (worker, reviewer or QA). Files may have changed since: read a file again before relying on it.${call.mode === "work" ? "" : " FLAMME's JSON at the end of it (CONTEXT_LOADED) only marked the context as loaded; it is not a result, and says nothing about the work."}\n` : prompt);
+  const fresh = seed ? `${system}\n---\n\n${prompt}- You start from the context FLAMME loaded (above), shared by every call of your kind (worker, reviewer or QA). Files may have changed since: read a file again before relying on it.${call.mode === "work" ? "" : " FLAMME's JSON at the end of it (CONTEXT_LOADED) only marked the context as loaded; it is not a result, and says nothing about the work."}\n` : prompt;
+  // A continued session already holds the role's instructions and its own earlier work.
+  const since = cont ? sinceLastCall(runDir, state, call, cont.since) : [];
+  writeFileSync(`${base}.prompt.md`, cont ? `${prompt}- You continue your own session from ${cont.from}: your earlier work in this stage is above. Since then:\n${since.map((l) => `  - ${l}`).join("\n") || "  - nothing but what is listed under Read"}\n  Files may have changed: read a file again before relying on it.\n` : fresh);
+  if (cont) writeFileSync(`${base}.prompt.fresh.md`, fresh);
   if (seed && !seed.sessionId) writeFileSync(`${base}.seed.prompt.md`, seedPrompt(runDir, state, call));
   const timeoutMs = Math.round(state.assignment.limits.callTimeoutMin * 60000);
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
   if (call.mode === "qa") mkdirSync(`${base}.evidence`, { recursive: true });
   // A unit's record lives in the parent's ai-log, outside the unit's worktree, where siblings
   // write too: the unit's guard covers its worktree, and Claude is denied the main checkout.
-  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, seed, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
+  writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, seed, continue: cont, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
   state.inflight = { ...call, provider: agent.provider, started: now() };
-  timeline(state, `${call.role.toUpperCase()} (${agentLabel(agent)})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}`);
+  timeline(state, `${call.role.toUpperCase()} (${agentLabel(agent)})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}${cont ? `, continuing its session from ${cont.from}` : ""}`);
   state.calls.push({ id: call.id, mode: call.mode, provider: agent.provider, model: agent.model, attempt: call.attempt, started: state.inflight.started });
   save(runDir, state);
   const child = spawn(process.execPath, [SCRIPT, "_exec", runDir, call.id], { cwd: ROOT, detached: true, stdio: "ignore" });
@@ -1636,13 +1681,14 @@ async function execCall(runDir, id) {
   const job = JSON.parse(readFileSync(`${base}.job.json`, "utf8"));
   const system = existsSync(`${base}.system.md`) ? readFileSync(`${base}.system.md`, "utf8") : "";
   const message = readFileSync(`${base}.prompt.md`, "utf8");
+  const freshMessage = existsSync(`${base}.prompt.fresh.md`) ? readFileSync(`${base}.prompt.fresh.md`, "utf8") : message;
   const structured = job.mode !== "work";
   const schemaPath = join(SKILL_DIR, "schemas", `${job.mode}.schema.json`);
   const outPath = `${base}.out.${structured ? "json" : "md"}`;
   const { provider, model, effort } = job.agent;
   // Claude gets the role as an appended system prompt, identical for every call of the role, so
   // calls share a cached prefix. Codex gets one message.
-  const prompt = job.seed || provider === "claude" || !system ? message : `${system}\n---\n\n${message}`;
+  const prompt = job.seed || provider === "claude" || !system ? freshMessage : `${system}\n---\n\n${freshMessage}`;
   // Permissions DENKEN granted to this role on request widen the defaults, never a reviewer's.
   const grants = { network: false, domains: [], dirs: [], tools: [], ...job.agent.grants };
   const network = job.agent.network || grants.network;
@@ -1654,7 +1700,7 @@ async function execCall(runDir, id) {
   // runs fresh, or as a fork of the seed FLAMME made for its role (job.seed): then its role text is
   // in its message, and its flags are exactly the seed's, so the fork reads the seed from the cache.
   const seed = job.seed ?? null;
-  const argsFor = ({ sessionId = null, forkOf = null, forSeed = false, out = outPath }) => {
+  const argsFor = ({ sessionId = null, forkOf = null, forSeed = false, out = outPath, resume = false }) => {
     if (provider === "claude") {
       const args = ["-p", "--output-format", "stream-json", "--verbose", "--session-id", sessionId];
       if (forkOf) args.push("--resume", forkOf, "--fork-session");
@@ -1694,7 +1740,8 @@ async function execCall(runDir, id) {
     // A Codex seed only reads. A fork takes its sandbox from -c, and would otherwise keep the
     // seed's, so every fork sets it.
     const mode = forSeed || job.mode === "review" ? "read-only" : "workspace-write";
-    const args = forkOf ? ["exec", "fork", forkOf, "--json", "-c", `sandbox_mode="${mode}"`, "-o", out] : ["exec", "--json", "-s", mode, "-o", out];
+    // Codex continues a worker's session in place (exec resume), which keeps its cache.
+    const args = forkOf ? ["exec", resume ? "resume" : "fork", forkOf, "--json", "-c", `sandbox_mode="${mode}"`, "-o", out] : ["exec", "--json", "-s", mode, "-o", out];
     if (!forSeed && network && job.mode !== "review") args.push("-c", "sandbox_workspace_write.network_access=true");
     if (!forSeed && job.mode !== "review" && grants.dirs.length) {
       if (forkOf) args.push("-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(grants.dirs)}`);
@@ -1712,29 +1759,46 @@ async function execCall(runDir, id) {
   const before = snapshot(runDir, id, job.log);
   const pinned = pinOwned(before.owned);
 
+  // A worker's later round continues its own session first. If that cannot start, the call starts
+  // the usual way below.
+  let result = null;
+  let run = null;
+  if (job.continue) {
+    meta.continue = { from: job.continue.from, sessionId: job.continue.sessionId, chain: job.continue.chain + 1, fallback: null };
+    if (provider === "claude") meta.sessionId = randomUUID();
+    result = await runCli(provider, argsFor({ sessionId: meta.sessionId, forkOf: job.continue.sessionId, resume: true }), message, base, job.timeoutMs);
+    run = readRun(provider, `${base}.log`, structured, outPath);
+    if (!result.timedOut && result.status !== 0 && !existsSync(outPath)) {
+      meta.continue.fallback = `continuing ${job.continue.sessionId} failed: ${oneLine(run.error ?? run.errorText, 200)}`;
+      renameSync(`${base}.log`, `${base}.continue-failed.log`);
+      result = null;
+    }
+  }
+  const started = !result;
   // FLAMME reads the role's context into a seed session, once; this call and the role's later calls
   // in the stage fork it. The seed only reads: a seed that changed anything is a violation.
-  let forkOf = seed?.sessionId ?? null;
-  meta.seed = seed ? { key: seed.key, sessionId: forkOf, created: false, rewarmed: false, fallback: null, facts: null } : null;
+  let forkOf = started ? seed?.sessionId ?? null : null;
+  meta.seed = seed && started ? { key: seed.key, sessionId: forkOf, created: false, rewarmed: false, fallback: null, facts: null } : null;
   // A seed's forks come minutes apart (rounds, the user's confirmation): the seed's prefix is written
   // to the cache for an hour rather than the default five minutes on API billing. Only the seed and
   // its re-warm write that way; a fork's own writes keep the default, cheaper rate.
   const cacheEnv = seed && provider === "claude" ? { CLAUDE_CODE_PROMPT_CACHE_TTL: "1h" } : null;
   // A seed idle for close to that hour is re-warmed: forked once with nothing to do, and that
   // session becomes the seed. Forks of a stale seed would each pay for the whole prefix again.
-  if (seed?.rewarm && forkOf) {
+  if (started && seed?.rewarm && forkOf) {
     const warmId = randomUUID();
     const nothing = structured ? `Nothing to do yet. Answer exactly: ${job.mode === "review" ? '{"verdict": "CONTEXT_LOADED", "summary": "Context kept warm.", "findings": [], "checked": []}' : '{"result": "CONTEXT_LOADED", "summary": "Context kept warm.", "items": []}'}` : "Nothing to do yet. Answer exactly: READY";
     const r = await runCli(provider, argsFor({ sessionId: warmId, forkOf, out: `${base}.rewarm.out` }), nothing, `${base}.rewarm`, job.timeoutMs, cacheEnv);
     if (r.status === 0 && !r.timedOut) Object.assign(meta.seed, { sessionId: warmId, rewarmed: true });
     forkOf = meta.seed.sessionId;
   }
-  if (seed && !forkOf) {
+  if (started && seed && !forkOf) {
+    const seedBefore = snapshot(runDir, id, job.log);
     const seedSession = provider === "claude" ? randomUUID() : null;
     const seedStarted = Date.now();
     const r = await runCli(provider, argsFor({ sessionId: seedSession, forSeed: true, out: `${base}.seed.out.md` }), readFileSync(`${base}.seed.prompt.md`, "utf8"), `${base}.seed`, job.timeoutMs, cacheEnv);
     const run = readRun(provider, `${base}.seed.log`, structured, `${base}.seed.out.md`);
-    const changed = violations(before, snapshot(runDir, id, job.log), { frozen: true, ignored: "all", allow: [] }, runDir, pinned, id);
+    const changed = violations(seedBefore, snapshot(runDir, id, job.log), { frozen: true, ignored: "all", allow: [] }, runDir, pinned, id);
     if (changed.length) {
       Object.assign(meta, { status: "guard_violation", violations: changed.map((v) => `FLAMME's seed: ${v}`), finished: now() });
       meta.facts = { ...facts, durationSec: Math.round((Date.now() - startedAt) / 1000) };
@@ -1748,11 +1812,13 @@ async function execCall(runDir, id) {
     forkOf = meta.seed.sessionId;
   }
 
-  if (provider === "claude") meta.sessionId = randomUUID();
-  let result = await runCli(provider, argsFor({ sessionId: meta.sessionId, forkOf }), prompt, base, job.timeoutMs);
-  let run = readRun(provider, `${base}.log`, structured, outPath);
+  if (started) {
+    if (provider === "claude") meta.sessionId = randomUUID();
+    result = await runCli(provider, argsFor({ sessionId: meta.sessionId, forkOf }), prompt, base, job.timeoutMs);
+    run = readRun(provider, `${base}.log`, structured, outPath);
+  }
   // A fork that could not start (its seed gone, say) runs once more from scratch.
-  if (forkOf && !result.timedOut && result.status !== 0 && !existsSync(outPath)) {
+  if (started && forkOf && !result.timedOut && result.status !== 0 && !existsSync(outPath)) {
     meta.seed.fallback = `the fork of ${forkOf} failed: ${oneLine(run.error ?? run.errorText, 200)}`;
     renameSync(`${base}.log`, `${base}.fork-failed.log`);
     if (provider === "claude") meta.sessionId = randomUUID();
@@ -1780,6 +1846,7 @@ async function execCall(runDir, id) {
   if (run.error) meta.error = run.error;
   const errorText = run.errorText;
   Object.assign(facts, run.facts);
+  if (meta.continue) facts.continued = meta.continue.fallback ? `not continued: ${meta.continue.fallback}` : `continued the session of ${meta.continue.from} (round ${meta.continue.chain} in it)`;
   if (meta.seed) facts.seed = meta.seed.fallback ? `not used: ${meta.seed.fallback}` : `forked from FLAMME's seed ${meta.seed.sessionId}${meta.seed.created ? ", made for this call" : ""}`;
   meta.exitCode = result.status;
   if (result.timedOut) meta.error = `timed out after ${Math.round(job.timeoutMs / 60000)} min`;
@@ -1937,6 +2004,12 @@ function ingest(runDir, state, meta) {
       delete state.seedSessions?.[meta.seed.key];
       timeline(state, "ENGINE", `${who} ran without FLAMME's seed: ${oneLine(meta.seed.fallback, 200)}`);
     }
+  }
+  // The worker's session, for its next round to continue.
+  if (meta.continue?.fallback) timeline(state, "ENGINE", `${who} could not continue its session, and started fresh: ${oneLine(meta.continue.fallback, 200)}`);
+  if (call.mode === "work" && meta.status === "ok" && meta.sessionId) {
+    const continued = meta.continue && !meta.continue.fallback;
+    (state.workSessions ??= {})[call.role] = { sessionId: meta.sessionId, call: call.id, stage: call.stage, epoch: state.seedEpoch ?? 0, profile: sha(JSON.stringify(profileOf(state, call, agentFor(state, call)))), chain: continued ? meta.continue.chain : 1, at: now() };
   }
   if (meta.status !== "ok") timeline(state, who, `${meta.status}${meta.error ? `: ${oneLine(meta.error)}` : ""}${meta.violations?.length ? `: ${meta.violations.join("; ")}` : ""}`);
 
