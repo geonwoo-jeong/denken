@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { EMPTY_TREE, EXCLUDE, fail, now, oneLine, pidAlive, print, REQUEST, ROOT, SCRIPT, sleep, TODO_DEV, TODO_QA, UNITS } from "./core.mjs";
-import { signalGroup, stopCallGroup } from "./exec.mjs";
+import { signalGroup, stopCallGroup } from "./process.mjs";
 import { gitAt, gitText } from "./git.mjs";
 import { projectPrint } from "./guard.mjs";
 import { acquireLock, assertLock } from "./lock.mjs";
