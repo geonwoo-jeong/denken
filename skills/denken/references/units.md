@@ -32,6 +32,8 @@ Write it in the run directory, next to `request.md`, and show it to the user wit
 - UNIT-2 (REQ-003) CSV export. Scope: `src/export/`, `test/export/`.
 ```
 
+A unit's line can add its own levels, which override the run's for that unit: `- UNIT-1 (REQ-001) Card height. Scope: \`src/quickviz/\`. Levels: dev=heavy.`
+
 `start` refuses the split unless it follows these rules:
 
 - Units are numbered UNIT-1, UNIT-2, … in order, at most 9 of them.

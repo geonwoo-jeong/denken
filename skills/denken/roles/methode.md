@@ -71,7 +71,7 @@ GENAU runs these checks independently, against the running product, and never se
 ```
 
 - Write every item as a checkbox line (`- [ ] QA-001 ...`) under `## Checks`, each id once. Every REQ item has at least one QA item. The QA item checks the REQ item's "Done when" by exercising the product, not by reading code.
-- Add QA items for OUT and LATER items wherever their absence can be observed.
+- Add QA items for OUT and LATER items wherever their absence can be observed, and for CAUTION items wherever they can be checked (`- [ ] QA-004 (CAUTION-001) ...`).
 - Write each check so that someone who did not build the product can run it exactly as written.
 
 Your final message is your submission, recorded word for word in the run's verdicts: one line saying what you submit, for example `Organized the 30 requirements into DEV-001–026 and QA-001–012.` From round 2, say what you changed in response to the review.

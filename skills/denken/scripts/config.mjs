@@ -17,6 +17,9 @@
 //       providers           comma-separated list of providers DENKEN may use
 //       allowSameReviewer   true lets the same provider, model and effort check its own work
 //       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits
+//       levels.<provider>.<light|heavy>.<model|effort>
+//                           what a level DENKEN picks for a stage means on each provider;
+//                           "standard" is always the role's own model and effort
 //
 // Files, later ones override earlier ones. Run from the project root.
 //   ~/.config/denken/config.json   --global  personal defaults for every project
@@ -30,6 +33,17 @@ import { fileURLToPath } from "node:url";
 
 export const SUPPORTED = ["claude", "codex"];
 export const DEFAULT_LIMITS = { topicRepeats: 3, roundsPerStage: 5, callTimeoutMin: 60, parallelUnits: 3 };
+// DENKEN picks a level per stage by the task's difficulty, to spend tokens where they matter.
+// "standard" keeps the role's configured model and effort. The defaults change effort first and
+// the model second, and use only the CLIs' model aliases, which never go stale; Codex has none,
+// so its levels change effort only unless a model is configured here.
+export const LEVELS = ["light", "standard", "heavy"];
+// Heavy stops at "high": "max" tends to overthink. Which values a model accepts depends on it.
+export const EFFORTS = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high", "xhigh", "max", "ultra"] };
+export const DEFAULT_LEVELS = {
+  claude: { light: { model: "sonnet", effort: "low" }, heavy: { model: "opus", effort: "high" } },
+  codex: { light: { effort: "low" }, heavy: { effort: "high" } },
+};
 const WORKER = { plan: "methode", dev: "stark", wiki: "serie" };
 const REVIEWER = { plan: "richter", dev: "ubel", wiki: "frieren" };
 const ROLES = ["methode", "stark", "serie", "richter", "ubel", "frieren", "genau"];
@@ -142,6 +156,24 @@ export function resolveConfig(root = process.cwd()) {
     else if (key === "callTimeoutMin" ? !(value > 0) : !Number.isInteger(value) || value < 1) errors.push(`limits.${key} must be a positive ${key === "callTimeoutMin" ? "number" : "integer"}`);
   }
   const allowSameReviewer = layers.reduce((acc, l) => l?.allowSameReviewer ?? acc, false) === true;
+  const levels = JSON.parse(JSON.stringify(DEFAULT_LEVELS));
+  for (const l of layers) {
+    for (const [provider, byLevel] of Object.entries(l?.levels ?? {})) {
+      if (!SUPPORTED.includes(provider)) {
+        errors.push(`levels.${provider}: unsupported provider`);
+        continue;
+      }
+      for (const [level, spec] of Object.entries(byLevel ?? {})) {
+        if (!["light", "heavy"].includes(level)) errors.push(`levels.${provider}.${level}: only light and heavy can be configured (standard is the role's own model and effort)`);
+        else levels[provider][level] = { ...levels[provider][level], ...spec };
+      }
+    }
+  }
+  for (const [provider, byLevel] of Object.entries(levels)) {
+    for (const [level, spec] of Object.entries(byLevel)) {
+      if (spec.effort != null && !EFFORTS[provider].includes(spec.effort)) errors.push(`levels.${provider}.${level}.effort must be one of ${EFFORTS[provider].join(", ")}`);
+    }
+  }
 
   const roles = mergeRoles(layers);
   const [first, second = first] = usable;
@@ -194,7 +226,7 @@ export function resolveConfig(root = process.cwd()) {
     warnings.push(`the same model checks its own work in ${sameReviewer.join(", ")}; runs will not start until you give the reviewer (${sameReviewer.map((st) => (st === "qa" ? "genau" : REVIEWER[st])).join(", ")}) a different model or effort, or set allowSameReviewer true`);
   }
 
-  return { errors, warnings, status, usable, crossProvider, sameReviewer, allowSameReviewer, sources, stages, limits };
+  return { errors, warnings, status, usable, crossProvider, sameReviewer, allowSameReviewer, sources, stages, limits, levels };
 }
 
 // ---------- CLI
@@ -224,6 +256,9 @@ function show(json) {
       row(stage, `${role.toUpperCase()} → ${describe(r.stages[stage].worker)}`, `${REVIEWER[stage].toUpperCase()} → ${describe(r.stages[stage].reviewer)}`);
       if (stage === "dev") row("qa", "", `GENAU → ${describe(r.stages.qa.runner)}`);
     }
+    const level = (spec) => [spec.model, spec.effort && `effort ${spec.effort}`].filter(Boolean).join(", ") || "as configured";
+    console.log(`\nLevels DENKEN picks per stage by difficulty (standard = each role as configured above):`);
+    for (const provider of SUPPORTED) console.log(`  ${provider.padEnd(7)} light: ${level(r.levels[provider].light)} · heavy: ${level(r.levels[provider].heavy)}`);
   }
   for (const w of r.warnings) console.log(`\nwarning: ${w}`);
   for (const e of r.errors) console.error(`\nerror: ${e}`);
@@ -240,6 +275,12 @@ function locate(config, key, create) {
   const parts = key.split(".");
   const [head, a] = parts;
   if ((head === "providers" || head === "allowSameReviewer") && parts.length === 1) return [config, head];
+  if (head === "levels" && parts.length === 4 && SUPPORTED.includes(a) && ["light", "heavy"].includes(parts[2]) && ["model", "effort"].includes(parts[3])) {
+    const levels = create ? (config.levels ??= {}) : config.levels ?? {};
+    const byProvider = create ? (levels[a] ??= {}) : levels[a] ?? {};
+    const spec = create ? (byProvider[parts[2]] ??= {}) : byProvider[parts[2]] ?? {};
+    return [spec, parts[3]];
+  }
   if (head === "limits" && parts.length === 2 && a in DEFAULT_LIMITS) {
     if (create) config.limits ??= {};
     return [config.limits ?? {}, a];
@@ -276,7 +317,7 @@ function main() {
   const paths = configPaths();
   const target = args.includes("--global") ? paths.global : args.includes("--local") ? paths.local : paths.shared;
   const [command, key, value] = args.filter((a) => !a.startsWith("--"));
-  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits`;
+  const keyHelp = `Keys: <role>[.model|.effort|.network] (roles: ${ROLES.join(", ")}), providers, allowSameReviewer, limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits, levels.<claude|codex>.<light|heavy>.<model|effort>`;
 
   if (!command) return show(args.includes("--json"));
   if (command === "init") {

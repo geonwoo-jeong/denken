@@ -30,7 +30,7 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSyn
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig } from "./config.mjs";
+import { EFFORTS, LEVELS, resolveConfig } from "./config.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const SKILL_DIR = join(dirname(SCRIPT), "..");
@@ -289,6 +289,90 @@ function reusedIds(runDir, state) {
     .map((i) => `${i.key} now reads differently from what the user confirmed. Ids are never reused: restore ${i.key}, or remove it and add the new wording under a number not used before`);
 }
 
+// ---------- levels: the model each role uses in this run
+// DENKEN picks a level per stage (or role) by the task's difficulty, to spend tokens where they
+// matter: light, standard (each role as configured) or heavy. The config says what a level means
+// on each provider. An explicit --model or --effort for a role wins over its level.
+const STAGE_ROLES = { plan: ["methode", "richter"], dev: ["stark", "ubel"], qa: ["genau"], wiki: ["serie", "frieren"] };
+const ROLE_NAMES = Object.values(STAGE_ROLES).flat();
+const rolesOf = (key) => STAGE_ROLES[key] ?? (ROLE_NAMES.includes(key) ? [key] : null);
+// Savings come from the workers. A checker (the reviewers and GENAU) never runs below standard,
+// nor below the level of the worker whose work it checks: a weak checker is where quality is lost.
+const RANK = { light: 0, standard: 1, heavy: 2 };
+const CHECKS = { richter: "methode", ubel: "stark", frieren: "serie", genau: "stark" };
+function levelOf(state, role) {
+  const own = state.levels?.[role] ?? "standard";
+  const worker = CHECKS[role] && (state.levels?.[CHECKS[role]] ?? "standard");
+  return worker && RANK[worker] > RANK[own] ? worker : own;
+}
+// "--level plan=light" (a stage's roles, or one role), "--model stark=<id>", "--effort ubel=high";
+// the levels command also takes bare "dev=heavy" pairs.
+function parseChoices(args, current = {}) {
+  const levels = { ...current.levels };
+  const overrides = JSON.parse(JSON.stringify(current.overrides ?? {}));
+  const pairs = [];
+  for (let i = 0; i < args.length; i++) {
+    if (["--level", "--model", "--effort"].includes(args[i])) pairs.push([args[i].slice(2), args[++i]]);
+    else if (args[i]?.startsWith("--")) i++;
+    else if (/^[a-z]+=\S+$/.test(args[i] ?? "")) pairs.push(["level", args[i]]);
+  }
+  for (const [kind, pair] of pairs) {
+    const [key, value] = String(pair ?? "").split("=");
+    const roles = rolesOf(key);
+    if (!roles || !value) fail(`--${kind} takes <stage or role>=<value>. Stages: ${Object.keys(STAGE_ROLES).join(", ")}; roles: ${ROLE_NAMES.join(", ")}`);
+    if (kind === "level") {
+      if (!LEVELS.includes(value)) fail(`a level is one of ${LEVELS.join(", ")} (got ${key}=${value})`);
+      // "plan=light" makes the planner light; its reviewer stays at standard.
+      if (value === "light" && roles.every((r) => CHECKS[r])) fail(`${key} checks other work (${roles.join(", ")}), and a checker never runs below standard`);
+      for (const r of roles) if (!(value === "light" && CHECKS[r])) levels[r] = value;
+    } else {
+      if (kind === "model" && roles.length > 1) fail("--model names one role: a stage's worker and reviewer may run on different providers");
+      for (const r of roles) (overrides[r] ??= {})[kind] = value;
+    }
+  }
+  return { levels, overrides };
+}
+// The agent a role runs as in this run: its configured agent, changed by its level, then by any
+// explicit model or effort DENKEN gave it.
+function effectiveAgent(state, role, base) {
+  const level = levelOf(state, role);
+  const mapped = level === "standard" ? {} : state.assignment.levels?.[base.provider]?.[level] ?? {};
+  const own = state.overrides?.[role] ?? {};
+  return { ...base, model: own.model ?? mapped.model ?? base.model, effort: own.effort ?? mapped.effort ?? base.effort, level };
+}
+function roleAgents(state) {
+  const agents = {};
+  for (const [stage, roles] of Object.entries(STAGE_ROLES)) {
+    const s = state.assignment.stages[stage];
+    const bases = stage === "qa" ? [s.runner] : [s.worker, s.reviewer];
+    roles.forEach((r, i) => (agents[r] = effectiveAgent(state, r, bases[i])));
+  }
+  return agents;
+}
+// Levels must not undo the separation: with one provider, a checker may not end up as the same
+// model and effort as the worker it checks, unless the user allowed it.
+function choiceProblems(state) {
+  const agents = roleAgents(state);
+  const problems = [];
+  for (const [r, a] of Object.entries(agents)) {
+    if (a.effort != null && !EFFORTS[a.provider]?.includes(a.effort)) problems.push(`${r} runs on ${a.provider}, whose effort is one of ${EFFORTS[a.provider].join(", ")} (got ${a.effort})`);
+  }
+  const same = (a, b) => a.provider === b.provider && modelFamily(a) === modelFamily(b) && a.effort === b.effort;
+  if (!state.assignment.allowSameReviewer) {
+    for (const [checker, worker] of Object.entries(CHECKS)) {
+      if (same(agents[worker], agents[checker])) problems.push(`${checker} would be the same model and effort as ${worker}, whose work it checks: give ${checker} a different level, model or effort`);
+    }
+  }
+  return problems;
+}
+// What a model string names: "opus" and "claude-opus-5-5" are the same model, so the separation
+// checks compare families, not strings. No model means the provider's default.
+function modelFamily(agent) {
+  const m = String(agent.model ?? "default").toLowerCase();
+  return agent.provider === "claude" ? m.match(/(?:^|claude-)(opus|sonnet|haiku|fable)\b/)?.[1] ?? m : m;
+}
+const agentLabel = (a) => `${a.provider}${a.model || a.effort ? `: ${[a.model, a.effort].filter(Boolean).join(", ")}` : ""}${a.level && a.level !== "standard" ? ` [${a.level}]` : ""}`;
+
 // ---------- units: one request built in parallel
 // units.md, DENKEN's optional split of the request into units that are built at the same time:
 //   - UNIT-1 (REQ-001, REQ-002) <title>. Scope: `src/a/`, `test/a/`.
@@ -303,13 +387,15 @@ function parseUnits(text) {
     const m = line.match(/^\s*[-*]\s*[*_`]*(UNIT-(\d+))\b[*_`]*\s*\(([^)]*)\)\s*(.*)$/);
     if (!m) continue;
     const [, id, n, refs, rest] = m;
-    const scopeText = rest.match(/\bScope:\s*(.*)$/i)?.[1] ?? "";
+    const part = (label) => rest.match(new RegExp(`\\b${label}:\\s*(.*?)(?=\\b(?:Scope|Levels?):|$)`, "i"))?.[1] ?? "";
     units.push({
       id,
       n: Number(n),
       reqs: refs.match(/\bREQ-\d{3,}\b/g) ?? [],
-      title: rest.replace(/\bScope:.*$/i, "").trim().replace(/[.\s]+$/, ""),
-      scope: [...scopeText.matchAll(/`([^`]+)`/g)].map((x) => x[1].trim()),
+      title: rest.split(/\b(?:Scope|Levels?):/i)[0].trim().replace(/[.\s]+$/, ""),
+      scope: [...part("Scope").matchAll(/`([^`]+)`/g)].map((x) => x[1].trim()),
+      // "Levels: dev=heavy, qa=standard": this unit's levels, over the run's.
+      levelPairs: [...part("Levels?").matchAll(/([a-z]+)=([a-z]+)/g)].map((x) => [x[1], x[2]]),
     });
   }
   return units;
@@ -335,6 +421,13 @@ function unitsProblems(runDir) {
     if (!u.scope.length) problems.push(`${u.id} needs a scope: the paths it may change, as \`src/a/\`, \`test/a/\``);
     for (const e of u.scope) if (/^\/|(^|\/)\.\.(\/|$)|[*?[\]{}]/.test(e) || !e.trim()) problems.push(`${u.id}: scope "${e}" must be a plain path inside the project, without globs`);
     for (const r of u.reqs) if (!reqs.includes(r)) problems.push(`${u.id} names ${r}, which request.md does not define`);
+    u.levels = {};
+    for (const [key, value] of u.levelPairs) {
+      const roles = rolesOf(key);
+      if (!roles || !LEVELS.includes(value)) problems.push(`${u.id}: "${key}=${value}" is not a level; use <stage or role>=<${LEVELS.join("|")}>`);
+      else if (value === "light" && roles.every((r) => CHECKS[r])) problems.push(`${u.id}: ${key} checks other work, and a checker never runs below standard`);
+      else for (const r of roles) if (!(value === "light" && CHECKS[r])) u.levels[r] = value;
+    }
   });
   for (const r of reqs) {
     const owners = units.filter((u) => u.reqs.includes(r)).map((u) => u.id);
@@ -480,12 +573,12 @@ function createUnits(runDir, state, units) {
     mkdirSync(join(run, "calls"), { recursive: true });
     if (!existsSync(join(root, ".denken", ".gitignore"))) writeFileSync(join(root, ".denken", ".gitignore"), "*\n");
     writeFileSync(join(run, REQUEST), unitRequest(runDir, u, units));
-    const child = { version: 1, task: `${state.task} · ${u.id}`, created: now(), log: logDir(state), verdicts: [], unit: u.id, title: u.title, mainRoot: ROOT, idBase: u.n * 100, scope: u.scope, ...runFields(state.assignment, base) };
+    const child = { version: 1, task: `${state.task} · ${u.id}`, created: now(), log: logDir(state), verdicts: [], unit: u.id, title: u.title, mainRoot: ROOT, idBase: u.n * 100, scope: u.scope, ...runFields(state.assignment, base), levels: { ...state.levels, ...u.levels }, overrides: state.overrides ?? {} };
     enterStage(child, "plan");
     logRequest(child, run);
     timeline(child, "DENKEN", `${u.id} (${u.reqs.join(", ")}) "${u.title}" starts in its own worktree; scope ${u.scope.join(", ")}`);
     save(run, child);
-    return { id: u.id, n: u.n, title: u.title, reqs: u.reqs, scope: u.scope, root: realpathSync(root), run: realpathSync(run), started: false, status: "queued", last: null, pulled: 0 };
+    return { id: u.id, n: u.n, title: u.title, reqs: u.reqs, scope: u.scope, levels: u.levels, root: realpathSync(root), run: realpathSync(run), started: false, status: "queued", last: null, pulled: 0 };
   });
   state.mainPrint = projectPrint(runDir);
 }
@@ -542,7 +635,7 @@ function parseItems(text, prefix) {
         problems.push({ key: m[2], problem: `${m[2]} appears more than once` });
         continue;
       }
-      current = { key: m[2], done: m[1] !== " ", refs: (m[3] ?? "").match(/\b(?:REQ|OUT|LATER|QA)-\d{3,}\b/g) ?? [], text: m[4].trim(), block: line, evidence: null, cycle };
+      current = { key: m[2], done: m[1] !== " ", refs: (m[3] ?? "").match(/\b(?:REQ|OUT|LATER|CAUTION|QA)-\d{3,}\b/g) ?? [], text: m[4].trim(), block: line, evidence: null, cycle };
       items.push(current);
       continue;
     }
@@ -587,7 +680,9 @@ function todoGaps(runDir) {
   const gaps = [];
   const gap = (identity, file, request_item, todo, problem, required_change) =>
     gaps.push({ identity, severity: "blocking", topic: identity, file, line_start: null, line_end: null, request_item, todo, problem, required_change, source: "engine" });
-  const known = new Set([...req.REQ.items, ...req.OUT.items, ...req.LATER.items].map((i) => i.key));
+  // A QA item may check any request item, a caution included; a DEV item builds REQ items and may
+  // name the cautions it keeps.
+  const known = new Set([...req.REQ.items, ...req.OUT.items, ...req.LATER.items, ...req.CAUTION.items].map((i) => i.key));
 
   if (!dev.length) gap("todo-dev-empty", TODO_DEV, null, null, "todo-dev.md has no DEV items", 'Write the development TODO under "## TODO" as "- [ ] DEV-001 (REQ-001) ..." items.');
   if (!qa.length) gap("todo-qa-empty", TODO_QA, null, null, "todo-qa.md has no QA items", 'Write the QA TODO under "## Checks" as "- [ ] QA-001 (REQ-001) ..." items.');
@@ -618,7 +713,7 @@ function todoGaps(runDir) {
     }
   }
   for (const q of qa) {
-    if (!q.refs.length) gap(q.key, TODO_QA, null, q.key, `${q.key} does not name the request item it verifies`, `Add the REQ, OUT or LATER item in parentheses after ${q.key}.`);
+    if (!q.refs.length) gap(q.key, TODO_QA, null, q.key, `${q.key} does not name the request item it verifies`, `Add the REQ, OUT, LATER or CAUTION item it checks in parentheses after ${q.key}.`);
     for (const r of q.refs) if (!known.has(r)) gap(q.key, TODO_QA, null, q.key, `${q.key} refers to ${r}, which request.md does not define`, "Refer only to items in request.md.");
   }
   return gaps;
@@ -1134,7 +1229,9 @@ function renderFacts(facts) {
     ["Exit", facts.exitCode],
     ["Duration", facts.durationSec != null ? `${facts.durationSec}s` : null],
     ["Cost", facts.costUsd != null ? `$${facts.costUsd.toFixed(4)}` : null],
-    ["Tokens", facts.tokens ? `in ${facts.tokens.input ?? "?"} · out ${facts.tokens.output ?? "?"} · cache read ${facts.tokens.cacheRead ?? "?"}` : null],
+    ["Level", facts.level],
+    ["Model that ran", facts.modelRan],
+    ["Tokens", facts.tokens ? `in ${facts.tokens.input ?? "?"} · out ${facts.tokens.output ?? "?"} · cache read ${facts.tokens.cacheRead ?? "?"}${facts.tokens.cacheWrite != null ? ` · cache write ${facts.tokens.cacheWrite}` : ""}` : null],
     ["HEAD", facts.head],
     ["Stage base", facts.stageBase],
     ["Grants", facts.grants ? JSON.stringify(facts.grants) : null],
@@ -1302,10 +1399,6 @@ function buildCall(runDir, state, call) {
   const roleFile = (name) => readFileSync(join(SKILL_DIR, "roles", `${name}.md`), "utf8").trimEnd();
   const roleText = call.mode === "review" ? `${roleFile(call.role)}\n\n${roleFile("reviewer")}` : roleFile(call.role);
   const lines = [
-    roleText.trimEnd(),
-    "",
-    "---",
-    "",
     "## This call",
     "",
     `- Stage: ${call.stage}, round ${call.round}. You run on ${agent.provider}${agent.model ? ` (${agent.model})` : ""}.`,
@@ -1317,12 +1410,14 @@ function buildCall(runDir, state, call) {
   if (write.length) lines.push(`- Write:\n${write.map((f) => `  - ${f}`).join("\n")}`);
   for (const e of extra) lines.push(`- ${e}`);
   if (call.mode !== "work") lines.push("- Your final message must be JSON that matches the provided schema.");
-  return { prompt: `${lines.join("\n")}\n`, guard, agent };
+  // The role's instructions never change between calls, so they go where they can be cached (the
+  // system prompt, for Claude); this call's facts follow as the message.
+  return { system: `${roleText.trimEnd()}\n`, prompt: `${lines.join("\n")}\n`, guard, agent };
 }
 
 function agentFor(state, call) {
   const s = state.assignment.stages[call.stage];
-  return call.mode === "qa" ? s.runner : call.mode === "work" ? s.worker : s.reviewer;
+  return effectiveAgent(state, call.role, call.mode === "qa" ? s.runner : call.mode === "work" ? s.worker : s.reviewer);
 }
 
 // ---------- launching and executing calls
@@ -1344,12 +1439,13 @@ function launch(runDir, state) {
   call.id = `${call.stage}-${call.role}-${call.round}`;
   call.nonce = randomUUID();
   const base = callBase(runDir, call.id);
-  const { prompt, guard, agent } = buildCall(runDir, state, call);
+  const { system, prompt, guard, agent } = buildCall(runDir, state, call);
   // Keep an earlier attempt's files for debugging, out of the way of the new attempt.
   const stamp = Date.now();
   for (const suffix of [".meta.json", ".pid", ".cli.pid", ".heartbeat", ".out.json", ".out.md", ".log"]) {
     if (existsSync(base + suffix)) renameSync(base + suffix, `${base}.prev-${stamp}${suffix}`);
   }
+  writeFileSync(`${base}.system.md`, system);
   writeFileSync(`${base}.prompt.md`, prompt);
   const timeoutMs = Math.round(state.assignment.limits.callTimeoutMin * 60000);
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
@@ -1358,7 +1454,7 @@ function launch(runDir, state) {
   // write too: the unit's guard covers its worktree, and Claude is denied the main checkout.
   writeFileSync(`${base}.job.json`, JSON.stringify({ ...call, agent: { ...agent, grants }, guard, timeoutMs, log: state.unit ? null : state.log ?? null, protect: state.mainRoot ?? null, stageBase: state.stageBase[call.stage] ?? null }, null, 2));
   state.inflight = { ...call, provider: agent.provider, started: now() };
-  timeline(state, `${call.role.toUpperCase()} (${agent.provider})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}`);
+  timeline(state, `${call.role.toUpperCase()} (${agentLabel(agent)})`, `started ${call.stage === "qa" ? `QA cycle ${call.round}` : `${call.stage} round ${call.round}`}${call.attempt > 1 ? `, attempt ${call.attempt}` : ""}`);
   state.calls.push({ id: call.id, mode: call.mode, provider: agent.provider, model: agent.model, attempt: call.attempt, started: state.inflight.started });
   save(runDir, state);
   const child = spawn(process.execPath, [SCRIPT, "_exec", runDir, call.id], { cwd: ROOT, detached: true, stdio: "ignore" });
@@ -1430,17 +1526,21 @@ async function execCall(runDir, id) {
   beat();
   const heartbeat = setInterval(beat, 5000);
   const job = JSON.parse(readFileSync(`${base}.job.json`, "utf8"));
-  const prompt = readFileSync(`${base}.prompt.md`, "utf8");
+  const system = existsSync(`${base}.system.md`) ? readFileSync(`${base}.system.md`, "utf8") : "";
+  const message = readFileSync(`${base}.prompt.md`, "utf8");
   const structured = job.mode !== "work";
   const schemaPath = join(SKILL_DIR, "schemas", `${job.mode}.schema.json`);
   const outPath = `${base}.out.${structured ? "json" : "md"}`;
   const { provider, model, effort } = job.agent;
+  // Claude gets the role as an appended system prompt, identical for every call of the role, so
+  // calls share a cached prefix. Codex gets one message.
+  const prompt = provider === "claude" || !system ? message : `${system}\n---\n\n${message}`;
   // Permissions DENKEN granted to this role on request widen the defaults, never a reviewer's.
   const grants = { network: false, domains: [], dirs: [], tools: [], ...job.agent.grants };
   const network = job.agent.network || grants.network;
   const meta = { status: "ok", nonce: job.nonce, exitCode: null, sessionId: null, denials: [], violations: [], error: null };
   const startedAt = Date.now();
-  const facts = { provider, model: model ?? null, effort: effort ?? null, cliVersion: (spawnSync(provider, ["--version"], { encoding: "utf8", timeout: 20000 }).stdout ?? "").trim().split("\n")[0] || null, head: gitText("rev-parse", "-q", "--verify", "HEAD") || null, stageBase: job.stageBase ?? null, grants: job.agent.grants ?? null };
+  const facts = { provider, model: model ?? null, effort: effort ?? null, level: job.agent.level ?? null, cliVersion: (spawnSync(provider, ["--version"], { encoding: "utf8", timeout: 20000 }).stdout ?? "").trim().split("\n")[0] || null, head: gitText("rev-parse", "-q", "--verify", "HEAD") || null, stageBase: job.stageBase ?? null, grants: job.agent.grants ?? null };
   let errorText = "";
 
   // Both CLIs stream JSON events; they go straight to the log so `status` can show progress.
@@ -1448,6 +1548,10 @@ async function execCall(runDir, id) {
   if (provider === "claude") {
     meta.sessionId = randomUUID();
     args = ["-p", "--output-format", "stream-json", "--verbose", "--session-id", meta.sessionId];
+    if (system) args.push("--append-system-prompt-file", `${base}.system.md`);
+    // Moving cwd and git status out of the system prompt lets calls in different directories (the
+    // units' worktrees) share it; within one directory it caches slightly worse, so it is kept to units.
+    if (system && job.protect) args.push("--exclude-dynamic-system-prompt-sections");
     // Reviewers and GENAU check other agents' work, so they load no project settings (a worker
     // could have planted hooks there) and no MCP servers.
     if (job.mode !== "work") args.push("--setting-sources", "user", "--strict-mcp-config");
@@ -1516,6 +1620,8 @@ async function execCall(runDir, id) {
     } catch {}
   }
   if (provider === "claude") {
+    // The model that actually ran: an alias or an allowlist can differ from what was asked for.
+    facts.modelRan = events.find((e) => e.type === "system" && e.subtype === "init")?.model ?? null;
     const final = events.findLast((e) => e.type === "result");
     if (final) {
       meta.denials = (final.permission_denials ?? []).map((d) => ({ tool: d.tool_name, input: d.tool_input }));
@@ -1526,7 +1632,7 @@ async function execCall(runDir, id) {
       const output = structured ? final.structured_output : final.result;
       if (output != null) writeFileSync(outPath, structured ? JSON.stringify(output, null, 2) : String(output));
       facts.costUsd = final.total_cost_usd ?? null;
-      facts.tokens = final.usage ? { input: final.usage.input_tokens ?? null, output: final.usage.output_tokens ?? null, cacheRead: final.usage.cache_read_input_tokens ?? null } : null;
+      facts.tokens = final.usage ? { input: final.usage.input_tokens ?? null, output: final.usage.output_tokens ?? null, cacheRead: final.usage.cache_read_input_tokens ?? null, cacheWrite: final.usage.cache_creation_input_tokens ?? null } : null;
       facts.turns = final.num_turns ?? null;
     }
   } else {
@@ -1730,7 +1836,7 @@ function ingest(runDir, state, meta) {
       state.inflight = call;
       return ingest(runDir, state, meta);
     }
-    state.lastWork[stage] = { call: call.id, denials: meta.denials };
+    state.lastWork[stage] = { call: call.id, denials: meta.denials, provider: call.provider, modelRan: meta.facts?.modelRan ?? null, effort: meta.facts?.effort ?? null };
     state.pending = "review";
     let rejectedTicks = [];
     if (stage === "dev") {
@@ -1778,6 +1884,16 @@ function ingest(runDir, state, meta) {
 
   const outPath = `${base}.out.json`;
   const output = JSON.parse(readFileSync(outPath, "utf8"));
+
+  // What actually ran can differ from what was asked for (an alias, an allowlist substituting a
+  // model). A checker that ran as the same model and effort as the worker it checks is not
+  // accepted as a check.
+  const worker = call.mode === "qa" ? state.lastWork.dev : state.lastWork[stage];
+  const ran = meta.facts?.modelRan;
+  if (!state.assignment.allowSameReviewer && ran && worker?.modelRan === ran && worker.provider === call.provider && (worker.effort ?? null) === (meta.facts.effort ?? null)) {
+    timeline(state, "ENGINE", `${who} ran as ${ran}, the same model and effort as the work it checks (${worker.call}); its result is not used`);
+    return block(state, "user", { reason: "same_model_ran", resolveWith: "retry", call: call.id, checked: worker.call, model: ran, effort: meta.facts.effort ?? null, role: call.role, ranAs: agentLabel(roleAgents(state)[call.role]) });
+  }
 
   if (call.mode === "qa") {
     state.lastQa = outPath;
@@ -1916,6 +2032,9 @@ function actionFor(runDir, state) {
         ? "METHODE left open questions. Ask the user, write the answers into request.md where they belong, then run rule --decision replan --note '<the answers>'."
         : "Show the user request.md and both TODO lists. If they approve, run confirm --user-said '<their approval, verbatim>'. If they want changes, edit request.md first when the request itself changes, then run rule --decision replan --note '<their changes>'.";
       return { action: "needs_user", ...b, files: [REQUEST, TODO_DEV, TODO_QA].map((f) => join(runDir, f)), openQuestions: questions, next };
+    }
+    if (b.reason === "same_model_ran") {
+      return { action: "needs_user", ...b, next: `${b.role.toUpperCase()} ran as the same model as the work it checks. Change it with levels <run> ${b.role}=<level> (or --model ${b.role}=<id> / --effort ${b.role}=<value>) --note '<why>', or ask the user to change it in config.mjs; then run retry. retry refuses while it would run the same way.` };
     }
     if (b.reason === "secrets_in_record") {
       return { action: "needs_user", ...b, next: "Show the user each file and line (not the value). Remove or redact the secret in the record, then run secrets --rescan; if they are false positives, run secrets --accept --user-said '<their words>'." };
@@ -2243,7 +2362,7 @@ function cmdNew(name) {
   print({ action: "created", run: relative(ROOT, dir), log: state.log, next: `Record your conversation with the user in ${relative(ROOT, join(dir, "conversation.md"))}, write ${relative(ROOT, join(dir, REQUEST))}, confirm it with the user, then run start.` });
 }
 
-function cmdStart(runDir) {
+function cmdStart(runDir, args = []) {
   const state = load(runDir);
   if (state.stage !== "intake") fail(`run already started (stage: ${state.stage})`);
   const problems = requestProblems(readRunFile(runDir, REQUEST));
@@ -2254,15 +2373,24 @@ function cmdStart(runDir) {
     print({ action: "needs_user", reason: "config", errors: config.errors, warnings: config.warnings, next: "Fix the configuration with config.mjs, then run start again." });
     process.exit(1);
   }
-  if (config.sameReviewer.length && !config.allowSameReviewer) {
-    print({ action: "needs_user", reason: "same_reviewer", stages: config.sameReviewer, next: "The same model would check its own work. Ask the user: set a different reviewer (richter, ubel, frieren) or genau model or effort with config.mjs, or set allowSameReviewer true. Then run start again." });
-    process.exit(1);
-  }
   const split = existsSync(join(runDir, UNITS)) ? unitsProblems(runDir) : null;
   if (split?.problems.length) fail(`${UNITS}: ${split.problems.join("; ")}`);
-  Object.assign(state, runFields({ crossProvider: config.crossProvider, sameReviewer: config.sameReviewer, stages: config.stages, limits: config.limits, warnings: config.warnings }, gitText("rev-parse", "-q", "--verify", "HEAD") || null));
+  Object.assign(state, runFields({ crossProvider: config.crossProvider, sameReviewer: config.sameReviewer, allowSameReviewer: config.allowSameReviewer, stages: config.stages, limits: config.limits, levels: config.levels, warnings: config.warnings }, gitText("rev-parse", "-q", "--verify", "HEAD") || null));
+  Object.assign(state, parseChoices(args));
+  // The levels DENKEN picked apply to every unit too, unless the unit's own line changes them.
+  for (const u of split?.units ?? []) {
+    const trial = { ...state, levels: { ...state.levels, ...u.levels } };
+    for (const p of choiceProblems(trial)) fail(`${u.id}'s levels: ${p}`);
+  }
+  const chosen = choiceProblems(state);
+  if (chosen.some((p) => p.includes("same model"))) {
+    print({ action: "needs_user", reason: "same_reviewer", problems: chosen, next: "The same model would check its own work. Give the checker a different level (start --level <role>=<level>), or ask the user to set a different model or effort for it with config.mjs, or to set allowSameReviewer true. Then run start again." });
+    process.exit(1);
+  }
+  if (chosen.length) fail(chosen.join("; "));
   logRequest(state, runDir);
-  const roles = Object.entries(config.stages).map(([stage, s]) => Object.entries(s).map(([k, a]) => `${stage}.${k}=${a.provider}`).join(" ")).join(" · ");
+  const agents = roleAgents(state);
+  const roles = Object.entries(agents).map(([r, a]) => `${r.toUpperCase()}=${agentLabel(a)}`).join(" · ");
   timeline(state, "DENKEN", `the user agreed the request; run started (${roles}) → 00-request/request.md`);
   if (split) {
     timeline(state, "DENKEN", `the request is split into ${split.units.length} units, built in parallel: ${split.units.map((u) => `${u.id} (${u.reqs.join(", ")}) in ${u.scope.join(", ")}`).join("; ")} → 00-request/${UNITS}`);
@@ -2271,7 +2399,7 @@ function cmdStart(runDir) {
   } else enterStage(state, "plan");
   assertLock();
   save(runDir, state);
-  print({ action: "started", log: state.log, run: relative(ROOT, runDir), units: state.units?.map((u) => ({ unit: u.id, reqs: u.reqs, scope: u.scope, worktree: u.root })) ?? null, crossProvider: config.crossProvider, stages: config.stages, limits: config.limits, warnings: config.warnings, next: "Run next with --wait." });
+  print({ action: "started", log: state.log, run: relative(ROOT, runDir), units: state.units?.map((u) => ({ unit: u.id, reqs: u.reqs, scope: u.scope, levels: u.levels, worktree: u.root })) ?? null, crossProvider: config.crossProvider, roles: agents, stages: config.stages, limits: config.limits, warnings: config.warnings, next: "Run next with --wait." });
 }
 
 function cmdRule(runDir, args) {
@@ -2350,6 +2478,9 @@ function cmdRetry(runDir) {
   const b = state.blocked;
   if (!b || b.kind !== "user") fail("nothing to retry: the run is not waiting on the user");
   if (b.resolveWith !== "retry") fail(`this block is resolved with ${b.resolveWith}, not retry`);
+  if (b.reason === "same_model_ran" && agentLabel(roleAgents(state)[b.role]) === b.ranAs) {
+    fail(`${b.role} would run the same way again (${b.ranAs}); change it first with levels <run> ${b.role}=<level> --note '<why>' (or --model / --effort)`);
+  }
   // Units: the project as it is now becomes what they are merged into, and the merge is tried again.
   if (state.stage === "units") {
     state.blocked = null;
@@ -2614,6 +2745,56 @@ function cmdSecrets(runDir, args) {
   print(actionFor(runDir, state));
 }
 
+// DENKEN changes levels mid-run, for example to give a stage that keeps failing a stronger
+// model; calls launched from now on use them.
+function cmdLevels(runDir, args) {
+  const state = load(runDir);
+  if (["intake", "done", "aborted"].includes(state.stage)) fail(`levels apply to a started run that is not finished (stage: ${state.stage}); at the start, pass them to start`);
+  const noteIndex = args.indexOf("--note");
+  const note = noteIndex >= 0 ? String(args[noteIndex + 1] ?? "").trim() : "";
+  if (!note) fail('say why: levels <run> <stage or role>=<level>... [--model <role>=<id>] [--effort <role>=<value>] --note "<why>"');
+  const before = roleAgents(state);
+  const next = parseChoices(args, state);
+  const problems = choiceProblems({ ...state, ...next });
+  if (problems.length) fail(problems.join("; "));
+  Object.assign(state, next);
+  const after = roleAgents(state);
+  const changed = Object.keys(after).filter((r) => agentLabel(after[r]) !== agentLabel(before[r])).map((r) => `${r.toUpperCase()} ${agentLabel(before[r])} → ${agentLabel(after[r])}`);
+  if (!changed.length) fail("nothing changes: every role already runs as asked");
+  timeline(state, "DENKEN", `levels changed for the calls from now on: ${changed.join("; ")}. ${oneLine(note, 200)}`);
+  verdict(state, "Levels", "DENKEN", "SET", `${changed.join("; ")}: ${note}`);
+  assertLock();
+  save(runDir, state);
+  print({ action: "levels", roles: after, next: "Calls launched from now on use these. Run next with --wait." });
+}
+
+// Tokens per role over the run's calls, and how much of the input came from the cache: the way to
+// see whether a level or a prompt change saved anything.
+function tokenReport(runDir, s) {
+  const byRole = {};
+  for (const c of s.calls ?? []) {
+    let meta;
+    try {
+      meta = JSON.parse(readFileSync(`${callBase(runDir, c.id)}.meta.json`, "utf8"));
+    } catch {
+      continue;
+    }
+    const t = meta.facts?.tokens;
+    if (!t) continue;
+    const role = c.id.split("-")[1];
+    const r = (byRole[role] ??= { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
+    r.calls++;
+    for (const k of ["input", "output", "cacheRead", "cacheWrite"]) r[k] += t[k] ?? 0;
+    r.costUsd += meta.facts.costUsd ?? 0;
+  }
+  for (const r of Object.values(byRole)) {
+    const read = r.input + r.cacheRead + r.cacheWrite;
+    r.fromCache = read ? `${Math.round((r.cacheRead / read) * 100)}%` : null;
+    r.costUsd = Math.round(r.costUsd * 10000) / 10000;
+  }
+  return byRole;
+}
+
 function cmdStatus(runDir) {
   const s = load(runDir);
   print({
@@ -2629,6 +2810,8 @@ function cmdStatus(runDir) {
     deferred: s.deferred?.length ?? 0,
     rulings: s.rulings?.map((r) => `${r.id} ${r.stage} ${r.subject} ${r.decision}`),
     calls: s.calls?.slice(-6).map((c) => `${c.id} ${c.provider} ${c.status ?? "running"}`),
+    roles: s.assignment ? Object.fromEntries(Object.entries(roleAgents(s)).map(([r, a]) => [r, agentLabel(a)])) : null,
+    tokens: tokenReport(runDir, s),
     ...(s.units ? { units: s.units.map((u) => ({ unit: u.id, status: u.status, stage: readUnit(u)?.stage ?? null, reason: u.last?.reason ?? null, worktree: existsSync(u.root) ? u.root : null })) } : {}),
   });
 }
@@ -2641,7 +2824,7 @@ const locked = async (fn) => {
 };
 // A command for one unit goes through the parent run, which alone says where the unit lives.
 const unitAt = rest.indexOf("--unit");
-if (unitAt >= 0 && ["rule", "retry", "confirm", "grant", "deny", "status", "secrets"].includes(command)) {
+if (unitAt >= 0 && ["rule", "retry", "confirm", "grant", "deny", "status", "secrets", "levels"].includes(command)) {
   const parent = load(runDirOf(runArg));
   const u = (parent.units ?? []).find((x) => x.id === rest[unitAt + 1]);
   if (!u) fail(`${rest[unitAt + 1] ?? "(none)"} is not a unit of this run${parent.units ? `; its units are ${parent.units.map((x) => x.id).join(", ")}` : ""}`);
@@ -2673,7 +2856,10 @@ switch (command) {
     cmdNew(runArg);
     break;
   case "start":
-    await locked(cmdStart);
+    await locked((runDir) => cmdStart(runDir, rest));
+    break;
+  case "levels":
+    await locked((runDir) => cmdLevels(runDir, rest));
     break;
   case "next": {
     const i = rest.indexOf("--wait");

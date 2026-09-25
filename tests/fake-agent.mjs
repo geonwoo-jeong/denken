@@ -28,6 +28,7 @@
 //   touch         a path to append to, relative to the project ("$RUN" is the run directory,
 //                 "$PROJ" the main project, where units are merged)
 //   devFiles      in a unit: the files METHODE's DEV items name (default: <scope>/work.txt)
+//   modelRan      the model the CLI reports it ran (default: the --model asked for, "-resolved")
 //   fail          exit 1 with this text on stderr
 //   denials       permission denials to report (claude only)
 //   sleepMs       wait this long before answering
@@ -50,7 +51,9 @@ if (args[0] === "--version") {
   console.log(`${cli} 0.0.0-fake`);
   process.exit(0);
 }
-const prompt = readFileSync(0, "utf8");
+// Claude gets the role's instructions as an appended system prompt, and this call's facts on stdin.
+const system = args.includes("--append-system-prompt-file") ? readFileSync(args[args.indexOf("--append-system-prompt-file") + 1], "utf8") : "";
+const prompt = `${system}\n${readFileSync(0, "utf8")}`;
 const scenarioPath = process.env.FAKE_SCENARIO;
 const scenario = JSON.parse(readFileSync(scenarioPath, "utf8"));
 
@@ -175,8 +178,10 @@ const text = typeof final === "string" ? final : JSON.stringify(final);
 if (cli === "claude") {
   const sessionId = args[args.indexOf("--session-id") + 1];
   const structured = typeof final === "string" ? null : final;
-  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }));
-  console.log(JSON.stringify({ type: "result", is_error: false, result: text, structured_output: structured, session_id: sessionId, permission_denials: step.denials ?? [] }));
+  const model = args.includes("--model") ? args[args.indexOf("--model") + 1] : "fake-default";
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: step.modelRan ?? `${model}-resolved` }));
+  const usage = { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 300, cache_creation_input_tokens: 100 };
+  console.log(JSON.stringify({ type: "result", is_error: false, result: text, structured_output: structured, session_id: sessionId, permission_denials: step.denials ?? [], usage, total_cost_usd: 0.01 }));
 } else {
   writeFileSync(args[args.indexOf("-o") + 1], text);
   console.log(JSON.stringify({ type: "thread.started", thread_id: `thread-${key}` }));

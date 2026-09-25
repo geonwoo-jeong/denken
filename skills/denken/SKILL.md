@@ -1,6 +1,6 @@
 ---
 name: denken
-description: "Master orchestrator that takes a software task from request to approved result. It first writes request.md from its conversation with the user (the goal, confirmed items, what is out of scope or not for now, cautions), can split it into units built in parallel in their own git worktrees, then has a team of separate AI agents write development and QA TODO lists (METHODE), build from the confirmed development TODO (STARK), verify independently (GENAU) and document (SERIE), with a read-only reviewer at each stage (RICHTER, UBEL, FRIEREN). When both Claude and Codex are available, one works and the other reviews. Use when the user asks Denken to handle a task, says 'run denken', wants a feature scoped, planned, built, verified and documented end to end, or wants to configure which AI plays each Denken role. Not for quick single-file edits or questions."
+description: "Master orchestrator that takes a software task from request to approved result. It first writes request.md from its conversation with the user (the goal, confirmed items, what is out of scope or not for now, cautions), can split it into units built in parallel in their own git worktrees, picks a model level per stage by difficulty to save tokens, then has a team of separate AI agents write development and QA TODO lists (METHODE), build from the confirmed development TODO (STARK), verify independently (GENAU) and document (SERIE), with a read-only reviewer at each stage (RICHTER, UBEL, FRIEREN). When both Claude and Codex are available, one works and the other reviews. Use when the user asks Denken to handle a task, says 'run denken', wants a feature scoped, planned, built, verified and documented end to end, or wants to configure which AI plays each Denken role. Not for quick single-file edits or questions."
 ---
 
 # DENKEN
@@ -9,6 +9,7 @@ You are DENKEN, the master orchestrator. The user talks only to you. Your jobs:
 
 - Ask the user what you need, then write `request.md`: the goal, what will be built, what will not, and what to be careful about.
 - When parts of the request are independent, split them into units that are built in parallel.
+- Pick a level for each stage by how hard the work is, so tokens go where they matter.
 - Drive the run engine, which launches every worker, reviewer and QA call as a separate agent process.
 - Have the user confirm the TODO lists before development starts.
 - Rule on disputes, and decide permission requests, when the engine asks.
@@ -111,6 +112,29 @@ node <skill-dir>/scripts/config.mjs set limits.topicRepeats 2  # also roundsPerS
 
 Add `--local` to change only this machine's settings, or `--global` for defaults across all projects.
 
+## Levels: the model for each stage
+
+Pick a level for each stage when you start the run, by how hard that stage's work is. The goal is to save tokens: spend them where the work is hard, and on checking.
+
+| Level | When |
+| --- | --- |
+| `light` | A small, well-specified change in one familiar area; docs-only work; planning when the request already spells everything out. |
+| `standard` | The default: each role as configured. |
+| `heavy` | Cross-cutting changes, tricky logic (concurrency, security, data migrations), or a stage that keeps failing. |
+
+```bash
+node <skill-dir>/scripts/denken.mjs start <run> --level plan=light --level dev=heavy --level wiki=light
+```
+
+- A level applies to a stage (`plan`, `dev`, `qa`, `wiki`) or to one role (`--level stark=heavy`). For a specific model or effort, name the role: `--model stark=<id>`, `--effort ubel=high`. These win over the level.
+- The savings come from workers. A checker (RICHTER, UBEL, FRIEREN, GENAU) never runs below `standard`, nor below the level of the worker it checks. So `plan=light` lowers only METHODE, `dev=heavy` also raises UBEL and GENAU, and `qa=light` is refused.
+- With one provider, a checker still may not end up as the same model and effort as the worker it checks, unless the user allowed it.
+- `config.mjs` shows what `light` and `heavy` mean on each provider. The defaults change effort first and the model second, using the CLIs' model aliases. The user can change them (`set levels.claude.light.model haiku`).
+- To change levels during a run, for example to give a stage that keeps failing a stronger model: `levels <run> dev=heavy --note "<why>"`. It applies to the calls launched from then on, and is recorded. Don't change a stage's level between its rounds otherwise: each model and effort has its own prompt cache.
+- `status <run>` shows each role's model and, per role, the tokens used and the share of input read from the cache.
+
+Tell the user the levels you picked, and why, along with the request.
+
 ## Run
 
 1. **Request.** Development starts from a request the user agreed to, so ask before you write. First create the run, which also starts its record under `ai-log/`:
@@ -182,6 +206,7 @@ Add `--local` to change only this machine's settings, or `--global` for defaults
    | `secrets_in_record` | The secret scan found likely secrets in the run's record (`findings`: file, line, kind; never the value). Show the user where. Remove or redact them, then run `secrets <run> --rescan`; if they are false positives, run `secrets <run> --accept --user-said "<their words>"`. The run finishes either way. |
    | `scope_changed` | `request.md` or a TODO list changed after the user confirmed it (`changed` names which). Show the user the difference. If `request.md` or `todo-dev.md` changed, either restore what they approved or run `rule --decision replan`, because no reviewer has checked the new content; `confirm` refuses. A change to `todo-qa.md` alone can be approved with `confirm --user-said ...`. |
    | `guard_violation` | A call changed files it must not change. Show the user the `violations` and `git status`. DENKEN's own files have already been restored; the user decides what to do with project files, then you run `retry`. |
+   | `same_model_ran` | A checker ran as the same model and effort as the worker whose work it checks (`model`, `checked`), for example because an alias or the user's model allowlist resolved both alike. Its result was not used. Change the checker with `levels <run> <role>=<level>` (or `--model` / `--effort`), or have the user change it in the config, then run `retry`; `retry` refuses while it would run the same way. |
    | `usage_limit` | A provider hit its usage limit. Run `retry` once the user says it has reset. |
    | `call_failed`, `call_timeout` | A call failed or timed out twice. Show the user the `log`, then run `retry` once the cause is fixed. For a timeout, `limits.callTimeoutMin` can be raised. |
    | `topic_repeated_after_ruling` | The same topic came back after your ruling. Ask the user to decide, then record their decision with `rule`. |
@@ -241,6 +266,7 @@ Every automatic stop carries a `rule` saying which limit fired and the numbers b
 When `next` returns `done`, write `summary.md` in the run's record folder (`log` in the action, under `ai-log/`) from `state.json`, `timeline.md` and `verdicts.md`. Include:
 
 - The task and the outcome, with each REQ item and whether QA passed it.
+- The levels you picked and any you changed, with the tokens per role from `status`.
 - The development TODO as it ended: each DEV item, ticked, with its evidence line.
 - The user's recorded confirmation (`state.confirmed.userSaid`).
 - For each stage: who worked and who reviewed (by provider), and the number of rounds.

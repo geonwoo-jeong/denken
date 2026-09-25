@@ -429,12 +429,19 @@ test("each role reads only its inputs: STARK the dev TODO, GENAU the request and
   assert.deepEqual(reads("dev-ubel-1"), ["request.md", "todo-dev.md", "dev-report.md", "dev-ubel-1.diff"]);
   assert.deepEqual(reads("qa-genau-1"), ["request.md", "todo-qa.md"]);
   assert.ok(reads("wiki-frieren-1").includes("request.md"));
-  // Each stage has its own reviewer, whose prompt adds the rules every reviewer shares.
+  // Each stage has its own reviewer, whose instructions add the rules every reviewer shares. The
+  // instructions are the call's system part, the same for every call of the role, so a provider
+  // can cache them; the call's own facts are the message.
   for (const [call, name] of [["plan-richter-1", "RICHTER"], ["dev-ubel-1", "UBEL"], ["wiki-frieren-1", "FRIEREN"]]) {
-    const prompt = readFileSync(join(t.proj, t.run, "calls", `${call}.prompt.md`), "utf8");
-    assert.ok(prompt.startsWith(`# ${name}:`));
-    assert.match(prompt, /## How every DENKEN reviewer works/);
+    const system = readFileSync(join(t.proj, t.run, "calls", `${call}.system.md`), "utf8");
+    assert.ok(system.startsWith(`# ${name}:`));
+    assert.match(system, /## How every DENKEN reviewer works/);
+    assert.ok(readFileSync(join(t.proj, t.run, "calls", `${call}.prompt.md`), "utf8").startsWith("## This call"));
   }
+  const claudeArgs = t.argsOf("dev-ubel-1");
+  assert.equal(claudeArgs[claudeArgs.indexOf("--append-system-prompt-file") + 1], join(realpathSync(t.proj), t.run, "calls", "dev-ubel-1.system.md"));
+  // Per-machine sections move out of the system prompt only in units' worktrees, where it helps.
+  assert.ok(!claudeArgs.includes("--exclude-dynamic-system-prompt-sections"));
 });
 
 test("TODO lists with coverage gaps go straight back to METHODE, each gap with its own identity", () => {
@@ -451,6 +458,15 @@ test("TODO lists with coverage gaps go straight back to METHODE, each gap with i
   assert.ok(gaps.some((g) => g.problem === "REQ-001 in the Acceptance section of todo-dev.md differs from request.md"));
   assert.ok(!gaps.some((g) => /QA-001/.test(g.problem)));
   assert.match(readFileSync(join(t.proj, t.run, "calls", "plan-methode-2.prompt.md"), "utf8"), /plan-methode-1\.gaps\.json/);
+});
+
+test("a QA item may check a caution, and a DEV item may name the cautions it keeps", () => {
+  const todoDev = "## Acceptance\n- REQ-001. One. Done when: one works.\n- REQ-002. Two. Done when: two works.\n\n## Do not build\n- OUT-001. Three.\n- LATER-001. Four.\n\n## Cautions\n- CAUTION-001. Keep it small.\n\n## TODO\n- [ ] DEV-001 (REQ-001, CAUTION-001) one\n- [ ] DEV-002 (REQ-002) two\n\n## Open questions\n- None\n";
+  const todoQa = "## Checks\n- [ ] QA-001 (REQ-001) one\n- [ ] QA-002 (REQ-002) two\n- [ ] QA-003 (CAUTION-001) the change stays small\n";
+  const t = setup({ "plan-methode-1": { todoDev, todoQa } });
+  t.denken("start", t.run);
+  assert.equal(t.drive().action, "done");
+  assert.ok(!t.calls().includes("claude plan-methode-2 rw"));
 });
 
 test("a QA item missing from the QA report counts as a failure", () => {
@@ -1105,6 +1121,7 @@ test("units: each unit plans, builds, is reviewed and verified in its own worktr
   assert.deepEqual(settingsOf("UNIT-1:plan-methode-1").permissions.deny, denied);
   assert.deepEqual(settingsOf("UNIT-2:qa-genau-1").permissions.deny, denied);
   assert.equal(settingsOf("qa-genau-1").permissions, undefined);
+  assert.ok(t.argsOf("UNIT-1:plan-methode-1").includes("--exclude-dynamic-system-prompt-sections"));
   assert.equal(readFileSync(join(t.proj, "a", "work.txt"), "utf8"), "change 1\n");
   assert.equal(readFileSync(join(t.proj, "b", "work.txt"), "utf8"), "change 1\n");
   // The merged lists: every DEV item as the unit ticked it, and every check verified again.
@@ -1233,4 +1250,82 @@ test("an inherited GIT_DIR (as in a git hook) does not point the tests or the en
   assert.equal(r.action, "done");
   assert.equal(readFileSync(join(outer, ".git", "config"), "utf8"), before);
   assert.equal(objects(), 0);
+});
+
+test("levels: DENKEN picks a level per stage; workers can go light, checkers never below standard or their worker", () => {
+  const t = setup();
+  const started = t.denken("start", t.run, "--level", "plan=light", "--level", "dev=heavy", "--level", "wiki=light").json;
+  assert.equal(started.action, "started");
+  const level = (r) => [started.roles[r].model, started.roles[r].effort, started.roles[r].level];
+  assert.deepEqual(level("methode"), ["sonnet", "low", "light"]); // claude light
+  assert.deepEqual(level("richter"), [null, null, "standard"]); // its checker stays at standard
+  assert.deepEqual(level("stark"), [null, "high", "heavy"]); // codex heavy: effort only
+  assert.deepEqual(level("ubel"), ["opus", "high", "heavy"]); // claude heavy, as heavy as the work it checks
+  assert.deepEqual(level("genau"), ["opus", "high", "heavy"]); // GENAU checks STARK's work too
+  assert.deepEqual(level("serie"), ["sonnet", "low", "light"]);
+  assert.equal(t.drive().action, "done");
+  const args = (key) => t.argsOf(key).join(" ");
+  assert.match(args("plan-methode-1"), /--model sonnet --effort low/);
+  assert.match(args("dev-stark-1"), /model_reasoning_effort="high"/);
+  assert.match(args("dev-ubel-1"), /--model opus --effort high/);
+  // The step file and the status show what ran, and how much came from the cache.
+  assert.match(readFileSync(join(t.proj, t.state().log, "01-planning", "01_methode-round1.md"), "utf8"), /- Level: light\n- Model that ran: sonnet-resolved\n- Tokens: in 100 · out 10 · cache read 300 · cache write 100/);
+  const status = t.denken("status", t.run).json;
+  assert.equal(status.roles.methode, "claude: sonnet, low [light]");
+  assert.equal(status.tokens.methode.fromCache, "60%");
+});
+
+test("levels: a checker can't be made light, and levels are checked before the run starts", () => {
+  const t = setup();
+  assert.match(t.denken("start", t.run, "--level", "qa=light").json.error, /qa checks other work \(genau\), and a checker never runs below standard/);
+  assert.match(t.denken("start", t.run, "--level", "richter=light").json.error, /a checker never runs below standard/);
+  assert.match(t.denken("start", t.run, "--level", "dev=turbo").json.error, /a level is one of light, standard, heavy/);
+  assert.match(t.denken("start", t.run, "--model", "plan=opus").json.error, /--model names one role/);
+  assert.match(t.denken("start", t.run, "--effort", "stark=max9").json.error, /stark runs on codex, whose effort is one of/);
+  assert.equal(t.denken("start", t.run, "--model", "stark=gpt-mini", "--effort", "genau=medium").json.action, "started");
+  assert.equal(t.state().overrides.stark.model, "gpt-mini");
+});
+
+test("levels: DENKEN can change them mid-run, and the change is recorded", () => {
+  const naming = changes(finding("naming"));
+  const t = setup({ "dev-ubel-1": naming, "dev-ubel-2": naming, "dev-ubel-3": naming });
+  t.denken("start", t.run);
+  assert.equal(t.drive().reason, "topic_repeated");
+  assert.match(t.denken("levels", t.run, "dev=heavy").json.error, /say why/);
+  const r = t.denken("levels", t.run, "dev=heavy", "--note", "The loop keeps failing on the same point; give it a stronger model.").json;
+  assert.equal(r.action, "levels");
+  t.denken("rule", t.run, "--decision", "dismiss", "--note", "Naming is a preference.");
+  assert.equal(t.drive().action, "done");
+  assert.match(t.argsOf("qa-genau-1").join(" "), /--model opus --effort high/);
+  assert.match(readFileSync(join(t.proj, t.state().log, "verdicts.md"), "utf8"), /· Levels · DENKEN · \*\*SET\*\* · STARK codex → codex: high \[heavy\]; UBEL claude → claude: opus, high \[heavy\]; GENAU claude → claude: opus, high \[heavy\]: The loop keeps failing/);
+});
+
+test("levels: a unit can carry its own levels", () => {
+  const t = setup();
+  t.split("- UNIT-1 (REQ-001) One. Scope: `a/`. Levels: dev=heavy.\n- UNIT-2 (REQ-002) Two. Scope: `b/`.\n");
+  assert.deepEqual(t.denken("start", t.run, "--level", "plan=light").json.units.map((u) => u.levels), [{ stark: "heavy", ubel: "heavy" }, {}]);
+  assert.equal(t.drive().action, "done");
+  assert.match(t.argsOf("UNIT-1:dev-stark-1").join(" "), /model_reasoning_effort="high"/);
+  assert.doesNotMatch(t.argsOf("UNIT-2:dev-stark-1").join(" "), /model_reasoning_effort/);
+  assert.match(t.argsOf("UNIT-2:plan-methode-1").join(" "), /--model sonnet --effort low/);
+});
+
+test("levels: the separation holds by model, not by name, and by what actually ran", () => {
+  // One provider: "opus" and "claude-opus-5-5" name the same model, so this is refused.
+  const one = { providers: ["claude"], roles: { richter: { effort: "high" }, frieren: { effort: "high" }, genau: { model: "haiku" }, stark: { model: "opus" }, ubel: { model: "claude-opus-5-5" } } };
+  const t = setup({}, one);
+  assert.equal(t.denken("start", t.run).json.reason, "same_reviewer");
+  // Asked for different models, but both ran as the same one (an alias, an allowlist): the check is not used.
+  const u = setup({ "dev-stark-1": { modelRan: "claude-opus-5-5" }, "dev-ubel-1": { modelRan: "claude-opus-5-5" } }, { ...one, roles: { ...one.roles, ubel: { model: "sonnet" } } });
+  assert.equal(u.denken("start", u.run).json.action, "started");
+  const r = u.drive();
+  assert.equal(r.reason, "same_model_ran");
+  assert.equal(r.checked, "dev-stark-1");
+  assert.match(readFileSync(join(u.proj, u.state().log, "timeline.md"), "utf8"), /UBEL ran as claude-opus-5-5, the same model and effort as the work it checks \(dev-stark-1\); its result is not used/);
+  assert.match(r.next, /levels <run> ubel=<level>/);
+  // Retrying the same assignment would only block again, so it waits for a change.
+  assert.match(u.denken("retry", u.run).json.error, /ubel would run the same way again/);
+  assert.equal(u.denken("levels", u.run, "ubel=heavy", "--note", "Check with a stronger effort than the work.").json.action, "levels");
+  assert.equal(u.denken("retry", u.run).json.action, "resumed");
+  assert.equal(u.drive().action, "done");
 });
