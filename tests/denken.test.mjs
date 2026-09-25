@@ -1333,17 +1333,17 @@ test("levels: the separation holds by model, not by name, and by what actually r
   assert.equal(u.drive().action, "done");
 });
 
-test("FLAMME: each Claude role's context is seeded once per stage, and every call of the role forks the seed with the same flags", () => {
+test("FLAMME: a worker seed, a reviewer seed and a QA seed; every call forks its kind's seed with the same flags", () => {
   const t = setup({ "plan-richter-1": changes(finding("scope", { file: "todo-dev.md" })) }, { seeds: { claude: true } });
   t.denken("start", t.run);
   assert.equal(t.drive().action, "done");
   const calls = t.calls();
-  // One seed per Claude role (METHODE, UBEL, GENAU, SERIE), made right before the role's first call.
-  assert.deepEqual(calls.filter((c) => c.includes("flamme")), ["claude plan-flamme-methode rw", "claude dev-flamme-ubel ro", "claude qa-flamme-genau rw", "claude wiki-flamme-serie rw"]);
-  assert.equal(calls[calls.indexOf("claude plan-flamme-methode rw") + 1], "claude plan-methode-1 rw");
+  // Claude's seeds: the workers' (made again once there is a confirmed development TODO), the reviewers' and QA's.
+  assert.deepEqual(calls.filter((c) => c.includes("flamme")), ["claude plan-flamme-worker rw", "claude dev-flamme-reviewer ro", "claude qa-flamme-qa rw", "claude wiki-flamme-worker rw"]);
+  assert.equal(calls[calls.indexOf("claude plan-flamme-worker rw") + 1], "claude plan-methode-1 rw");
   assert.ok(!calls.some((c) => c.startsWith("codex") && c.includes("flamme")));
   // Both of METHODE's rounds fork the same seed, with exactly the seed's flags.
-  const seedArgs = t.argsOf("plan-flamme-methode");
+  const seedArgs = t.argsOf("plan-flamme-worker");
   const seedId = seedArgs[seedArgs.indexOf("--session-id") + 1];
   const shape = (args) => args.filter((a, i) => !["--session-id", "--resume"].includes(args[i - 1]) && !["--resume", "--fork-session"].includes(a));
   for (const key of ["plan-methode-1", "plan-methode-2"]) {
@@ -1356,17 +1356,21 @@ test("FLAMME: each Claude role's context is seeded once per stage, and every cal
   }
   // A fork's role is in its message, since the forked session keeps the seed's system prompt.
   assert.ok(readFileSync(join(t.proj, t.run, "calls", "plan-methode-1.prompt.md"), "utf8").startsWith("# METHODE:"));
-  // FLAMME reads only the role's own inputs.
+  // A worker seed never holds the request (STARK sees only the development TODO); the reviewer seed does.
   const seedPrompt = (call) => readFileSync(join(t.proj, t.run, "calls", `${call}.seed.prompt.md`), "utf8");
-  assert.match(seedPrompt("plan-methode-1"), /- Seed for: methode \(METHODE, the planning worker\)\. Perspective: worker\.\n[\s\S]*- Read:\n {2}- \S+request\.md\n/);
-  assert.match(seedPrompt("dev-ubel-1"), /Perspective: checker\.[\s\S]*- Read:\n {2}- \S+request\.md\n {2}- \S+todo-dev\.md\n- This call answers in JSON/);
+  assert.match(seedPrompt("plan-methode-1"), /- Seed for: worker\. Used by the workers who plan, build and document \(METHODE, STARK, SERIE\)\.\n[\s\S]*- Read: nothing from the run yet; the project itself\n/);
+  assert.match(seedPrompt("wiki-serie-1"), /- Seed for: worker\.[\s\S]*- Read:\n {2}- \S+todo-dev\.md\n/);
+  assert.doesNotMatch(seedPrompt("wiki-serie-1"), /request\.md/);
+  assert.match(seedPrompt("dev-ubel-1"), /- Seed for: reviewer\.[\s\S]*- Read:\n {2}- \S+request\.md\n- This call answers in JSON/);
+  // METHODE gets the request in its own message.
+  assert.match(readFileSync(join(t.proj, t.run, "calls", "plan-methode-1.prompt.md"), "utf8"), /- Read:\n {2}- \S+request\.md/);
   // No hook of anyone's interactive sessions runs in a DENKEN call.
-  for (const key of ["plan-flamme-methode", "plan-methode-1", "dev-ubel-1", "qa-genau-1"]) {
+  for (const key of ["plan-flamme-worker", "plan-methode-1", "dev-ubel-1", "qa-genau-1"]) {
     const args = t.argsOf(key);
     assert.equal(JSON.parse(args[args.indexOf("--settings") + 1]).disableAllHooks, true, key);
   }
   assert.equal(Object.keys(t.state().seedSessions).length, 4);
-  assert.match(readFileSync(join(t.proj, t.state().log, "timeline.md"), "utf8"), /\*\*FLAMME \(claude\)\*\* · seeded METHODE's context for the plan stage \(in 100 · cache read 300 · out 10\); METHODE's calls fork it/);
+  assert.match(readFileSync(join(t.proj, t.state().log, "timeline.md"), "utf8"), /\*\*FLAMME \(claude\)\*\* · seeded the worker context in the plan stage, for plan-methode-1 \(in 100 · cache read 300 · out 10\); calls with the same perspective and settings fork it/);
   assert.match(readFileSync(join(t.proj, t.state().log, "01-planning", "03_methode-round2.md"), "utf8"), new RegExp(`- Seed: forked from FLAMME's seed ${seedId}\\n`));
   assert.equal(t.denken("status", t.run).json.tokens.flamme.calls, 4);
 });
@@ -1376,13 +1380,15 @@ test("FLAMME on Codex: forks always set their own sandbox, and a worker's seed n
   t.denken("start", t.run);
   assert.equal(t.drive().action, "done");
   const stark = t.argsOf("dev-stark-1");
-  assert.deepEqual(stark.slice(0, 3), ["exec", "fork", "thread-dev-flamme-stark"]);
+  assert.deepEqual(stark.slice(0, 3), ["exec", "fork", "thread-dev-flamme-worker"]);
   assert.ok(stark.includes('sandbox_mode="workspace-write"') && !stark.includes("-s"));
   const richter = t.argsOf("plan-richter-1");
-  assert.deepEqual(richter.slice(0, 3), ["exec", "fork", "thread-plan-flamme-richter"]);
+  assert.deepEqual(richter.slice(0, 3), ["exec", "fork", "thread-plan-flamme-reviewer"]);
   assert.ok(richter.includes('sandbox_mode="read-only"'));
+  // FRIEREN, a reviewer with the same settings, forks the same reviewer seed.
+  assert.deepEqual(t.argsOf("wiki-frieren-1").slice(0, 3), ["exec", "fork", "thread-plan-flamme-reviewer"]);
   // The seed itself only reads.
-  assert.ok(t.argsOf("dev-flamme-stark").join(" ").includes("-s read-only"));
+  assert.ok(t.argsOf("dev-flamme-worker").join(" ").includes("-s read-only"));
   const starkSeed = readFileSync(join(t.proj, t.run, "calls", "dev-stark-1.seed.prompt.md"), "utf8");
   assert.match(starkSeed, /- Read:\n {2}- \S+todo-dev\.md\n/);
   assert.doesNotMatch(starkSeed, /request\.md/);
@@ -1393,10 +1399,10 @@ test("FLAMME: a fork that cannot start runs from scratch; a seed that changes fi
   t.denken("start", t.run);
   assert.equal(t.drive().action, "done");
   assert.match(readFileSync(join(t.proj, t.state().log, "timeline.md"), "utf8"), /\*\*ENGINE\*\* · UBEL ran without FLAMME's seed: the fork of \S+ failed/);
-  assert.ok(!Object.values(t.state().seedSessions).some((s) => s.role === "ubel"));
+  assert.ok(!Object.values(t.state().seedSessions).some((s) => s.perspective === "reviewer"));
   assert.ok(!t.argsOf("dev-ubel-1", 2).includes("--resume"));
 
-  const u = setup({ "plan-flamme-methode": { touch: "a.txt" } }, { seeds: { claude: true } });
+  const u = setup({ "plan-flamme-worker": { touch: "a.txt" } }, { seeds: { claude: true } });
   u.denken("start", u.run);
   const r = u.drive();
   assert.equal(r.reason, "guard_violation");
@@ -1422,18 +1428,18 @@ test("FLAMME: a checker's seed ends with a placeholder, not a verdict; a seed id
   // An hour passes while DENKEN decides.
   const path = join(t.proj, t.run, "state.json");
   const state = JSON.parse(readFileSync(path, "utf8"));
-  const before = Object.values(state.seedSessions).find((x) => x.role === "ubel").sessionId;
+  const before = Object.values(state.seedSessions).find((x) => x.perspective === "reviewer").sessionId;
   for (const x of Object.values(state.seedSessions)) x.lastUsedAt = new Date(Date.now() - 2 * 3600000).toISOString();
   writeFileSync(path, JSON.stringify(state));
   t.denken("grant", t.run, "--network", "--user-said", "Fine.", "--note", "Fixture download.");
   assert.equal(t.drive().action, "done");
   const calls = t.calls();
   assert.equal(calls[calls.indexOf("claude dev-ubel-2 ro") - 1], "claude rewarm");
-  const after = Object.values(t.state().seedSessions).find((x) => x.role === "ubel").sessionId;
+  const after = Object.values(t.state().seedSessions).find((x) => x.perspective === "reviewer").sessionId;
   assert.notEqual(after, before);
   const ubel2 = t.argsOf("dev-ubel-2");
   assert.equal(ubel2[ubel2.indexOf("--resume") + 1], after);
-  assert.match(readFileSync(join(t.proj, t.state().log, "timeline.md"), "utf8"), /FLAMME \(claude\)\*\* · re-warmed UBEL's seed, idle for close to an hour, before dev-ubel-2 forked it/);
+  assert.match(readFileSync(join(t.proj, t.state().log, "timeline.md"), "utf8"), /FLAMME \(claude\)\*\* · re-warmed the reviewer seed, idle for close to an hour, before dev-ubel-2 forked it/);
   // Seeded Claude calls keep their cache for an hour.
   assert.equal(JSON.parse(readFileSync(join(t.proj, t.run, "calls", "dev-ubel-2.job.json"), "utf8")).seed.rewarm, true);
 });

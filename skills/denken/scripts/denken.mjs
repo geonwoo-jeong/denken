@@ -374,33 +374,43 @@ function modelFamily(agent) {
 const agentLabel = (a) => `${a.provider}${a.model || a.effort ? `: ${[a.model, a.effort].filter(Boolean).join(", ")}` : ""}${a.level && a.level !== "standard" ? ` [${a.level}]` : ""}`;
 
 // ---------- FLAMME: seeds
-// FLAMME, the seed AI, reads a role's context once per stage into a seed session; each call of
-// the role then forks that seed, works, and is thrown away. Every call starts from the same clean
-// point, and on Claude, whose cache is keyed by content, the fork reads the seed from the cache.
-// A seed belongs to one role, so a worker never starts from a checker's context (which holds the
-// request); it reads only the role's own inputs. Its key also holds everything that shapes the
-// call's flags (provider, model, effort, mode, network, grants, worktree), because a fork must
-// match its seed exactly to reuse the cache. The engine alone keeps the seeds, in state.json.
-const SEED_INPUTS = { methode: [REQUEST], richter: [REQUEST], stark: [TODO_DEV], ubel: [REQUEST, TODO_DEV], genau: [REQUEST, TODO_QA], serie: [REQUEST, TODO_DEV, "dev-report.md"], frieren: [REQUEST] };
-const ROLE_TITLE = { methode: "planning worker", richter: "planning reviewer", stark: "development worker", ubel: "development reviewer", genau: "independent QA", serie: "wiki worker", frieren: "wiki reviewer" };
+// FLAMME, the seed AI, first gets to know the project (its layout, conventions, wiki and plan)
+// and that context is kept as a seed session. Calls fork a seed, work, and are thrown away: every
+// call starts from the same clean, loaded context, and on Claude, whose cache is keyed by content,
+// even a role's first call reads the seed from the cache. There is a worker seed, a reviewer seed
+// and a QA seed. Workers fork the worker seed, which never holds request.md, so STARK still sees
+// only the development TODO; METHODE and SERIE get the request in their own message. Reviewers
+// fork the reviewer seed, which holds the request; GENAU has its own, as it runs with other tools.
+// The checkers' seeds serve every stage while code and docs change, so they hold where things are,
+// never their content (roles/flamme.md): a checker judges the files as they are when it checks.
+// A fork must match its seed's flags exactly to reuse the cache, so a seed's key also holds what
+// shapes them (provider, model, effort, mode, network, grants, worktree). The engine alone keeps
+// the seeds, in state.json.
+const PERSPECTIVE = { work: "worker", review: "reviewer", qa: "qa" };
+// While METHODE plans, the development TODO is its own draft, not something to start from.
+const seedInputs = (perspective, stage) => ({ worker: stage === "plan" ? [] : [TODO_DEV], reviewer: [REQUEST], qa: [REQUEST, TODO_QA] })[perspective];
+const SEED_USE = { worker: "the workers who plan, build and document (METHODE, STARK, SERIE)", reviewer: "the reviewers who check plans, code and docs against the request (RICHTER, UBEL, FRIEREN)", qa: "GENAU, who verifies the product independently" };
 // A seed is made again when what it read changes (ticks and evidence aside), and a Claude seed not
 // used for close to the cache's hour is re-warmed first: its prefix would no longer be cached.
 const SEED_REWARM_MS = 55 * 60000;
 function seedFor(runDir, state, call, agent) {
   if (!(state.seeding ?? []).includes(agent.provider)) return null;
+  const perspective = PERSPECTIVE[call.mode];
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
-  const inputs = SEED_INPUTS[call.role].map((f) => (f.startsWith("todo-") ? planText(readRunFile(runDir, f)) : readRunFile(runDir, f)));
+  const inputs = seedInputs(perspective, call.stage).map((f) => (f.startsWith("todo-") ? planText(readRunFile(runDir, f)) : readRunFile(runDir, f)));
   const profile = sha(JSON.stringify([agent.provider, agent.model ?? null, agent.effort ?? null, call.mode, Boolean(agent.network), grants, state.mainRoot ?? null, inputs])).slice(0, 12);
-  const key = `${call.role}#${state.seedEpoch ?? 0}#${profile}`;
+  const key = `${perspective}#${state.seedEpoch ?? 0}#${profile}`;
   const known = state.seedSessions?.[key];
   const idle = known ? Date.now() - Date.parse(known.lastUsedAt ?? known.at) : 0;
-  return { key, sessionId: known?.sessionId ?? null, rewarm: agent.provider === "claude" && idle > SEED_REWARM_MS };
+  return { key, perspective, sessionId: known?.sessionId ?? null, rewarm: agent.provider === "claude" && idle > SEED_REWARM_MS };
 }
 function seedPrompt(runDir, state, call) {
+  const perspective = PERSPECTIVE[call.mode];
   const answer = {
-    review: `{"verdict": "CONTEXT_LOADED", "summary": "Context loaded for ${call.role.toUpperCase()}.", "findings": [], "checked": [<the files you read>]}`,
-    qa: `{"result": "CONTEXT_LOADED", "summary": "Context loaded for GENAU.", "items": []}`,
+    review: `{"verdict": "CONTEXT_LOADED", "summary": "Reviewer context loaded.", "findings": [], "checked": [<the files you read>]}`,
+    qa: `{"result": "CONTEXT_LOADED", "summary": "QA context loaded.", "items": []}`,
   }[call.mode];
+  const inputs = seedInputs(perspective, call.stage).filter((f) => existsSync(join(runDir, f)));
   return [
     readFileSync(join(SKILL_DIR, "roles", "flamme.md"), "utf8").trimEnd(),
     "",
@@ -409,10 +419,10 @@ function seedPrompt(runDir, state, call) {
     "## This seed",
     "",
     `- Stage: ${call.stage}`,
-    `- Seed for: ${call.role} (${call.role.toUpperCase()}, the ${ROLE_TITLE[call.role]}). Perspective: ${CHECKS[call.role] ? "checker" : "worker"}.`,
+    `- Seed for: ${perspective}. Used by ${SEED_USE[perspective]}.`,
     `- Project root: ${ROOT}`,
     `- Run directory: ${runDir}`,
-    `- Read:\n${SEED_INPUTS[call.role].map((f) => `  - ${join(runDir, f)}`).join("\n")}`,
+    `- Read:${inputs.length ? `\n${inputs.map((f) => `  - ${join(runDir, f)}`).join("\n")}` : " nothing from the run yet; the project itself"}`,
     ...(answer ? [`- This call answers in JSON; end with exactly: ${answer}`] : []),
     "",
   ].join("\n");
@@ -1494,7 +1504,7 @@ function launch(runDir, state) {
   const seed = seedFor(runDir, state, call, agent);
   writeFileSync(`${base}.system.md`, system);
   // A forked session keeps its seed's system prompt, so a seeded call's role goes in its message.
-  writeFileSync(`${base}.prompt.md`, seed ? `${system}\n---\n\n${prompt}- You start from the context FLAMME loaded for your role (above). Files may have changed since: read a file again before relying on it.${call.mode === "work" ? "" : " FLAMME's JSON at the end of it (CONTEXT_LOADED) only marked the context as loaded; it is not a result, and says nothing about the work."}\n` : prompt);
+  writeFileSync(`${base}.prompt.md`, seed ? `${system}\n---\n\n${prompt}- You start from the context FLAMME loaded (above), shared by every call of your kind (worker, reviewer or QA). Files may have changed since: read a file again before relying on it.${call.mode === "work" ? "" : " FLAMME's JSON at the end of it (CONTEXT_LOADED) only marked the context as loaded; it is not a result, and says nothing about the work."}\n` : prompt);
   if (seed && !seed.sessionId) writeFileSync(`${base}.seed.prompt.md`, seedPrompt(runDir, state, call));
   const timeoutMs = Math.round(state.assignment.limits.callTimeoutMin * 60000);
   const grants = call.mode === "review" ? null : state.grants?.[call.role] ?? null;
@@ -1917,11 +1927,11 @@ function ingest(runDir, state, meta) {
     const t = meta.seed.facts?.tokens;
     if (!meta.seed.fallback && meta.seed.sessionId) {
       const known = (state.seedSessions ??= {})[meta.seed.key];
-      state.seedSessions[meta.seed.key] = { ...(known ?? { role: call.role, stage: call.stage, provider: call.provider, call: call.id, at: now() }), sessionId: meta.seed.sessionId, lastUsedAt: now() };
-      if (meta.seed.rewarmed) timeline(state, `FLAMME (${call.provider})`, `re-warmed ${who}'s seed, idle for close to an hour, before ${call.id} forked it`);
+      state.seedSessions[meta.seed.key] = { ...(known ?? { perspective: meta.seed.key.split("#")[0], stage: call.stage, provider: call.provider, call: call.id, at: now() }), sessionId: meta.seed.sessionId, lastUsedAt: now() };
+      if (meta.seed.rewarmed) timeline(state, `FLAMME (${call.provider})`, `re-warmed the ${meta.seed.key.split("#")[0]} seed, idle for close to an hour, before ${call.id} forked it`);
     }
     if (meta.seed.created && !meta.seed.fallback) {
-      timeline(state, `FLAMME (${call.provider})`, `seeded ${who}'s context for the ${call.stage} stage${t ? ` (in ${t.input ?? "?"} · cache read ${t.cacheRead ?? "?"} · out ${t.output ?? "?"})` : ""}; ${who}'s calls fork it`);
+      timeline(state, `FLAMME (${call.provider})`, `seeded the ${meta.seed.key.split("#")[0]} context in the ${call.stage} stage, for ${call.id}${t ? ` (in ${t.input ?? "?"} · cache read ${t.cacheRead ?? "?"} · out ${t.output ?? "?"})` : ""}; calls with the same perspective and settings fork it`);
     }
     if (meta.seed.fallback) {
       delete state.seedSessions?.[meta.seed.key];

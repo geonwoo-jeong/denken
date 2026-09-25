@@ -28,7 +28,7 @@ You never plan, code, review, test or document yourself. You never edit a run's 
 | SERIE | Wiki / knowledge worker | the files this run changed, the docs that mention them, request, TODO, reports | docs, `wiki-report.md` | Claude | [roles/serie.md](roles/serie.md) |
 | RICHTER | Planning reviewer, read-only | `request.md`, both TODO lists | reviews | the other provider from METHODE | [roles/richter.md](roles/richter.md) |
 | UBEL | Development reviewer, read-only: code, TODO status and evidence, and change scope against the plan | `request.md`, `todo-dev.md`, `dev-report.md`, the diff, scope facts | reviews | the other provider from STARK | [roles/ubel.md](roles/ubel.md) |
-| FLAMME | Seed AI: once per stage, reads a role's context into a seed session that the role's calls fork | the role's own inputs, and the project's layout and conventions | a seed session, nothing in the project | runs as the role it seeds; on for Claude, off for Codex | [roles/flamme.md](roles/flamme.md) |
+| FLAMME | Seed AI: gets to know the project first (layout, conventions, wiki, plan) and keeps it as a worker seed, a reviewer seed and a QA seed that the calls fork | the worker seed: the development TODO; the reviewer seed: `request.md`; the QA seed: `request.md`, `todo-qa.md`; and the project itself | seed sessions, nothing in the project | runs as the calls that fork it; on for Claude, off for Codex | [roles/flamme.md](roles/flamme.md) |
 | FRIEREN | Wiki reviewer, read-only: do the docs match the code? | `request.md`, `wiki-report.md`, the doc diff, the changed code | reviews | the other provider from SERIE | [roles/frieren.md](roles/frieren.md) |
 
 ```text
@@ -115,11 +115,14 @@ Add `--local` to change only this machine's settings, or `--global` for defaults
 
 ## Seeds: FLAMME
 
-FLAMME, the seed AI, reads a role's context once per stage into a seed session: the role's own inputs, and the project's layout and conventions. Every call of that role in the stage then forks the seed, does its work, and is thrown away. Each call starts from the same clean point, without the noise of earlier calls. On Claude, the fork reads the seed from the prompt cache instead of paying for it again.
+FLAMME, the seed AI, gets to know the project before the team's calls start: its layout, conventions, wiki pages and plan. It keeps what it read as a seed session. Every call then forks a seed, does its work, and is thrown away. Each call starts from the same clean, loaded context, without the noise of earlier calls, and on Claude even a role's first call reads that context from the prompt cache.
 
-- **One seed per role:** a worker never forks a checker's seed, which holds the request, and FLAMME reads only what the role itself may read. So STARK's seed has `todo-dev.md` and the code, not `request.md`.
+- **Three seeds:**
+  - The **worker** seed is for METHODE, STARK and SERIE. It holds the development TODO once planning is done, but never `request.md`, so STARK still sees only the development TODO. METHODE and SERIE get the request in their own message.
+  - The **reviewer** seed is for RICHTER, UBEL and FRIEREN. It holds `request.md`, the conventions and checklists, and where the code and docs are, never their content: it serves every stage while they change, and a checker judges the files as they are.
+  - The **QA** seed is for GENAU. It holds `request.md`, `todo-qa.md`, and how to run the product and its tests, likewise without code content. GENAU runs with other tools than the reviewers, so it cannot share their seed.
 - **Claude and Codex differ:**
-  - A Claude fork has exactly its seed's flags (model, effort, tools, settings), so it hits the seed's cache. Its role instructions are in its message, because a forked session keeps the seed's system prompt.
+  - A Claude fork has exactly its seed's flags (model, effort, tools, schema, settings), so it hits the seed's cache. Calls whose flags differ, for example because of different levels, get separate seeds of the same kind. A fork's role instructions are in its message, because a forked session keeps the seed's system prompt.
   - Codex keys its cache by session, so a fork re-reads the whole seed uncached; seeding costs more there than it saves, and is off by default. When it is on, every Codex fork sets its own sandbox, which it would otherwise inherit from the seed.
 - **When to use it:** seeds pay off when a role's context is large and a stage takes several rounds. For a small task, start the run with `--seeds off`. `config.mjs set seeds.codex true` turns seeding on for Codex; `status` shows FLAMME's tokens beside each role's, to check.
 - **Freshness:** a seed is made again when what it read changes (ticks and evidence aside), or when the plan is redone. FLAMME loads what stays put (conventions, architecture, interfaces, and the paths of the files the work touches), and the role reads the current content of those files itself. A Claude seed idle for close to an hour is re-warmed before its next fork, and a seed's prefix is cached for an hour.

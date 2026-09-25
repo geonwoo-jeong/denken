@@ -17,8 +17,8 @@
 //       providers           comma-separated list of providers DENKEN may use
 //       allowSameReviewer   true lets the same provider, model and effort check its own work
 //       limits.topicRepeats, limits.roundsPerStage, limits.callTimeoutMin, limits.parallelUnits
-//       seeds.<provider>      true | false: FLAMME seeds each role's context once per stage and
-//                           every call forks from it (default: claude true, codex false)
+//       seeds.<provider>      true | false: FLAMME keeps worker, reviewer and QA seed sessions that
+//                           every call forks (default: claude true, codex false)
 //       levels.<provider>.<light|heavy>.<model|effort>
 //                           what a level DENKEN picks for a stage means on each provider;
 //                           "standard" is always the role's own model and effort
@@ -269,7 +269,7 @@ function show(json) {
       if (stage === "dev") row("qa", "", `GENAU → ${describe(r.stages.qa.runner)}`);
     }
     const level = (spec) => [spec.model, spec.effort && `effort ${spec.effort}`].filter(Boolean).join(", ") || "as configured";
-    console.log(`\nSeeds:     FLAMME seeds each role's context once per stage for ${SUPPORTED.filter((p) => r.seeds[p]).join(" and ") || "no provider"}`);
+    console.log(`\nSeeds:     FLAMME keeps worker, reviewer and QA seeds that calls fork, for ${SUPPORTED.filter((p) => r.seeds[p]).join(" and ") || "no provider"}`);
     console.log(`\nLevels DENKEN picks per stage by difficulty (standard = each role as configured above):`);
     for (const provider of SUPPORTED) console.log(`  ${provider.padEnd(7)} light: ${level(r.levels[provider].light)} · heavy: ${level(r.levels[provider].heavy)}`);
   }

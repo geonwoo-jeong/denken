@@ -48,7 +48,7 @@ units   optional: independent parts of a request run plan, dev and qa in paralle
 | UBEL | Development reviewer: checks code, TODO status and change scope against the plan, read-only | the other provider from STARK |
 | FRIEREN | Wiki reviewer: checks the docs against the code and the request, read-only | the other provider from SERIE |
 | GENAU | Independent QA: runs the QA TODO against the product | the other provider from STARK |
-| FLAMME | Seed AI: loads a role's context once per stage; the role's calls fork it | runs as the role it seeds |
+| FLAMME | Seed AI: gets to know the project first; worker, reviewer and QA calls fork its seeds | runs as the calls that fork it |
 
 How it works:
 
@@ -63,7 +63,7 @@ How it works:
   ```
 
 - **Parallel units:** DENKEN can split a request into units that touch different files and don't depend on each other (`units.md`). Each unit is planned, built, reviewed and verified in its own git worktree, at the same time as the others (up to `limits.parallelUnits`). When all are done, they are merged all or none, and the merged change is reviewed and verified again. Work that overlaps in scope or depends on other work is not split; it runs in order within one unit.
-- **Seeds (FLAMME):** once per stage, FLAMME reads a role's context into a seed session, and every call of that role forks it and is then thrown away. Calls start clean, and on Claude they read the seed from the prompt cache. Codex caches per session, so seeding is off there by default.
+- **Seeds (FLAMME):** FLAMME gets to know the project first (layout, conventions, wiki, plan) and keeps it as a worker seed, a reviewer seed and a QA seed. Every call forks its kind's seed and is then thrown away, so calls start clean, and on Claude they read the seed from the prompt cache. Codex caches per session, so seeding is off there by default.
 - **Levels:** DENKEN picks a level per stage (`light`, `standard`, `heavy`) by how hard the work is, to save tokens. Workers can go light for simple work; checkers never run below standard or below the worker they check. What each level means per provider is configurable (`levels.<provider>.<level>.<model|effort>`), and `status` shows tokens and cache use per role.
 - **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
 - **Permissions:** workers run with least privilege. One that needs more (network, a directory outside the project, a blocked command) asks through the engine and stops; DENKEN grants the minimum or denies it, and anything broad (all network, a directory outside the project) needs your explicit answer. Agent configuration (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`) and DENKEN's own files cannot be changed by any agent.
