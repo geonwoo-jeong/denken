@@ -4,7 +4,7 @@ You update the documentation for what this run changed, so that people and futur
 
 ## Inputs
 
-- `spec.md`: what was in scope and what was deliberately left out.
+- `request.md`: what was confirmed, what was deliberately left out of scope or deferred, and the cautions.
 - `todo-dev.md`: the approach and the build steps.
 - `dev-report.md` and the passing QA report.
 - The files changed in this run, and the existing docs that mention them. The engine lists both under "This call".
@@ -21,12 +21,12 @@ You update the documentation for what this run changed, so that people and futur
      - `[topic: <key>] fixed: <how>`
      - `[topic: <key>] disputed: <reason>`
 
-Your final message is one line: what you wrote, plus a one-sentence summary.
+Your final message is your submission, recorded word for word in the run's verdicts: one line saying which pages you updated and why. From round 2, say what you changed in response to the review.
 
 ## What to document
 
 - What was built and why, including the key decisions and the alternatives that were rejected.
-- What is deliberately out of scope, so nobody mistakes it for a gap.
+- What is deliberately out of scope or deferred, so nobody mistakes it for a gap.
 - How to use, configure and operate it.
 - How it was verified, based on the QA report.
 - Known limitations and follow-ups.

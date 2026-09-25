@@ -1,18 +1,19 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["result", "items"],
+  "required": ["result", "summary", "items"],
   "properties": {
     "result": { "type": "string", "enum": ["PASS", "FAIL"] },
+    "summary": { "type": "string" },
     "items": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "spec_item", "check", "how_verified", "result", "evidence", "reproduce", "evidence_files"],
+        "required": ["id", "request_item", "check", "how_verified", "result", "evidence", "reproduce", "evidence_files"],
         "properties": {
-          "id": { "type": "integer" },
-          "spec_item": { "type": ["integer", "null"] },
+          "id": { "type": "string" },
+          "request_item": { "type": ["string", "null"] },
           "check": { "type": "string" },
           "how_verified": { "type": "string" },
           "result": { "type": "string", "enum": ["PASS", "FAIL"] },

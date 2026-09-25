@@ -19,40 +19,48 @@ npx skills add geonwoo-jeong/denken --skill <name> -g -a claude-code
 
 | Skill | Description |
 | ----- | ----------- |
-| [denken](skills/denken/SKILL.md) | Master orchestrator. Agrees a spec with you, has TODO lists written and confirmed, then builds, verifies and documents the work. Each stage is reviewed read-only by a different AI, and only approved results are delivered. |
+| [denken](skills/denken/SKILL.md) | Master orchestrator. Writes a request with you, has TODO lists written and confirmed, then builds, verifies and documents the work. Each stage is reviewed read-only by a different AI, and only approved results are delivered. |
 
 ### The DENKEN team
 
 ```text
-spec    DENKEN ⇄ you          spec.md: in scope (S1..), out of scope (X1..)
-plan    METHODE ⇄ RICHTER     todo-dev.md (D1..), todo-qa.md (Q1..)
-        you confirm the scope and both TODO lists
-dev     STARK ⇄ UBEL          item by item: build, unit test, tick off (todo-dev.md only)
+request DENKEN ⇄ you          request.md: goal, confirmed (REQ-001..), out of scope (OUT-..),
+                              not now (LATER-..), cautions (CAUTION-..)
+plan    METHODE ⇄ RICHTER     todo-dev.md (DEV-001..), todo-qa.md (QA-001..)
+        you confirm the request and both TODO lists
+dev     STARK ⇄ UBEL          item by item: build, unit test, tick off with evidence (todo-dev.md only)
 qa      GENAU                 runs todo-qa.md and saves evidence
-          fail → recovery TODO (todo-fix.md) → STARK fixes → UBEL approves → QA again
+          fail → recovery TODO (todo-fix.md, FIX-001..) → STARK fixes → UBEL approves → QA again
 wiki    SERIE ⇄ FRIEREN       only the docs affected by the files this run changed
 done    approved results only; the whole run is recorded in ai-log/
 ```
 
 | Name | Role | Default provider |
 | ---- | ---- | ---------------- |
-| DENKEN | Orchestrator. The only agent you talk to; asks what it needs and writes the spec | the agent you run it in |
-| METHODE | Planning worker: turns the spec into a development TODO and a QA TODO | Claude |
-| STARK | Development worker: builds the development TODO item by item (build, unit test, tick off) | Codex |
+| DENKEN | Orchestrator. The only agent you talk to; asks what it needs and writes `request.md` | the agent you run it in |
+| METHODE | Planning worker: turns the request into a development TODO and a QA TODO; the only one who words TODO items | Claude |
+| STARK | Development worker: builds the development TODO item by item (build, unit test, tick off with evidence) | Codex |
 | SERIE | Wiki / knowledge worker | Claude |
-| RICHTER | Planning reviewer: checks the TODO lists against the spec, read-only | the other provider from METHODE |
+| RICHTER | Planning reviewer: checks the TODO lists against the request, read-only | the other provider from METHODE |
 | UBEL | Development reviewer: checks code, TODO status and change scope against the plan, read-only | the other provider from STARK |
-| FRIEREN | Wiki reviewer: checks the docs against the code and the spec, read-only | the other provider from SERIE |
+| FRIEREN | Wiki reviewer: checks the docs against the code and the request, read-only | the other provider from SERIE |
 | GENAU | Independent QA: runs the QA TODO against the product | the other provider from STARK |
 
 How it works:
 
-- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent writes the spec with you, rules on disputes and reports back.
+- **Separation:** every worker, reviewer and QA call is a separate `claude -p` or `codex exec` process, started by a deterministic run engine (`skills/denken/scripts/denken.mjs`). The DENKEN agent writes the request with you, rules on disputes and reports back.
 - **Read-only review:** reviewers are read-only. Claude gets only Read, Grep and Glob; Codex runs in its read-only sandbox. A review that changes a file is rejected.
-- **Approval gate:** a stage moves on only after its review has no blocking findings. The engine also checks that the TODO lists cover every in-scope item and nothing out of scope, and development waits for you to confirm them.
+- **Approval gate:** a stage moves on only after its review has no blocking findings. The engine also checks that the TODO lists cover every confirmed item and nothing out of scope or deferred, and development waits for you to confirm them.
+- **TODO lists:** only METHODE words the items, and only STARK ticks development items. No tick without evidence: STARK ticks an item through the engine, which runs its tests, checks that the evidence names a file changed for the item, and writes the tick and evidence into the list:
+
+  ```markdown
+  - [x] DEV-002 (REQ-002) Card height defaults to 520px, adjustable from 320 to 1,600px. Files: QuickVizLocalPage.tsx.
+    Evidence: added normalHeightPx to QuickVizLocalPage.tsx, kept separate from the fullscreen height
+  ```
+
 - **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
 - **Permissions:** workers run with least privilege. One that needs more (network, a directory outside the project, a blocked command) asks through the engine and stops; DENKEN grants the minimum or denies it, and anything broad (all network, a directory outside the project) needs your explicit answer. Agent configuration (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`) and DENKEN's own files cannot be changed by any agent.
-- **Record:** every run is written to `ai-log/<date>/<NNN>_<time>_<name>/` as it goes: `00-request`, `01-planning`, `02-development`, `03-qa` (with evidence), `04-wiki`, `raw/` (every exchange) and `timeline.md` (every step, verdict, stop and resume). Raw exchanges and QA evidence are git-ignored by default, and a secret scan runs before DONE.
+- **Record:** every run is written to `ai-log/<date>/<NNN>_<time>_<name>/` as it goes: `00-request`, `01-planning`, `02-development`, `03-qa` (with evidence), `04-wiki`, `raw/` (every exchange), `timeline.md` (every step, verdict, stop and resume) and `verdicts.md` (every submission and verdict exchanged, READY, REJECTED, APPROVED, PASSED, in the words it was given). Raw exchanges and QA evidence are git-ignored by default, and a secret scan runs before DONE.
 - **Single provider:** with only Claude or only Codex installed, everything runs on that provider.
 
 ### Choosing which AI plays each role

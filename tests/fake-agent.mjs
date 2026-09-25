@@ -2,16 +2,21 @@
 // Stand-in for the claude and codex CLIs in tests, scripted by the JSON file in $FAKE_SCENARIO.
 // Scenario keys are "<stage>-<role>-<round>". A value is one step, or an array of steps for
 // successive attempts of the same call. A step can set:
-//   review | qa   the structured final message (default: approve / pass every Q item)
-//   todoDev       text METHODE writes to todo-dev.md (default covers S1 and S2)
-//   todoQa        text METHODE writes to todo-qa.md (default covers S1 and S2)
-//   tick          D ids STARK ticks off with the tick command (default: all of them)
-//   tickFail      D ids whose tick command fails (they stay unticked)
+//   review | qa   the structured final message (default: approve / pass every QA item)
+//   todoDev       text METHODE writes to todo-dev.md (default covers REQ-001 and REQ-002)
+//   todoQa        text METHODE writes to todo-qa.md (default covers REQ-001 and REQ-002)
+//   tick          DEV numbers STARK ticks off with the tick command (default: all of them)
+//   tickFail      DEV numbers whose tick command fails (they stay unticked)
+//   evidence      the evidence STARK passes to the tick command (default: changed src.txt)
+//   noChange      { DEV number: reason } items STARK ticks with --no-change instead of --evidence
+//   fixEvidence   the evidence STARK passes when ticking FIX items (default: fixed the cause in src.txt)
 //   tickArgs      the argv STARK passes to the tick command (default: echo ok)
-//   fixTick       false: STARK leaves the recovery (F) items unticked
-//   tickByHand    D ids STARK ticks by editing todo-dev.md directly, with no test run
-//   untickByHand  D ids STARK unticks by editing todo-dev.md directly
-//   tickOther     a non-D id (like "Q1") whose checkbox STARK ticks by hand in the TODO section
+//   fixTick       false: STARK leaves the recovery (FIX) items unticked
+//   tickByHand    DEV numbers STARK ticks by editing todo-dev.md directly
+//   untickByHand  DEV numbers STARK unticks by editing todo-dev.md directly
+//   tickOther     a non-DEV label (like "note") whose checkbox STARK ticks by hand in the TODO section
+//   editTodo      [[from, to], ...] text STARK replaces by hand in todo-dev.md, after ticking
+//   forgeTicks    [{ item, evidence, log? }] tick records STARK writes by hand, skipping the tick command
 //   editFiles     { path: content } a worker writes in the project (STARK: before ticking)
 //   removeFiles   paths a worker deletes from the project
 //   appendFiles   { path: text } a worker appends to files in the project
@@ -26,12 +31,14 @@
 //   staleMeta     write a result file from another attempt of this call before answering
 // Each call is logged as "<cli> <key> <ro|rw> <net|nonet|->".
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
-export const DEFAULT_TODO_DEV = "# Development TODO\n\n## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) build one\n- [ ] D2 (S2) build two\n\n## Open questions\n- None\n";
-export const DEFAULT_TODO_QA = "# QA TODO\n\n## Checks\n- [ ] Q1 (S1) check one\n- [ ] Q2 (S2) check two\n";
-const pass = (id) => ({ id, spec_item: id, check: `check ${id}`, how_verified: "fake", result: "PASS", evidence: "ok", reproduce: null });
+export const DEFAULT_TODO_DEV = "# Development TODO\n\n## Acceptance\n- REQ-001. One. Done when: one works.\n- REQ-002. Two. Done when: two works.\n\n## Do not build\n- OUT-001. Three.\n- LATER-001. Four.\n\n## Cautions\n- CAUTION-001. Keep it small.\n\n## TODO\n- [ ] DEV-001 (REQ-001) build one\n- [ ] DEV-002 (REQ-002) build two\n\n## Open questions\n- None\n";
+export const DEFAULT_TODO_QA = "# QA TODO\n\n## Checks\n- [ ] QA-001 (REQ-001) check one\n- [ ] QA-002 (REQ-002) check two\n";
+const pad = (n) => String(n).padStart(3, "0");
+const pass = (n) => ({ id: `QA-${pad(n)}`, request_item: `REQ-${pad(n)}`, check: `check ${n}`, how_verified: "fake", result: "PASS", evidence: "ok", reproduce: null });
 
 const cli = basename(process.argv[1]);
 const args = process.argv.slice(2);
@@ -90,15 +97,15 @@ if (step.requestPermission) {
   const [, script] = prompt.match(/node "([^"]+)" request-permission "/);
   spawnSync(process.execPath, [script, "request-permission", runDir, "--need", step.requestPermission.need, "--why", step.requestPermission.why], { stdio: "ignore" });
   final = `stopped: asked for ${step.requestPermission.need}`;
-} else if (["richter", "ubel", "frieren"].includes(role)) final = step.review ?? { verdict: "APPROVED", findings: [], checked: ["fake review"] };
+} else if (["richter", "ubel", "frieren"].includes(role)) final = step.review ?? { verdict: "APPROVED", summary: `${role} found nothing to change`, findings: [], checked: ["fake review"] };
 else if (role === "genau") {
   // Leave an evidence file per item, as GENAU does, and point to it from the report.
-  final = step.qa ?? { result: "PASS", items: [pass(1), pass(2)] };
+  final = step.qa ?? { result: "PASS", summary: "every check passed on the running product", items: [pass(1), pass(2)] };
   const evidence = join(runDir, "calls", `${key}.evidence`);
   mkdirSync(evidence, { recursive: true });
   for (const item of final.items) {
-    writeFileSync(join(evidence, `q${item.id}.txt`), `Q${item.id}: ${item.result}\n${step.evidenceText ?? ""}`);
-    item.evidence_files = [join(evidence, `q${item.id}.txt`)];
+    writeFileSync(join(evidence, `${item.id}.txt`), `${item.id}: ${item.result}\n${step.evidenceText ?? ""}`);
+    item.evidence_files = [join(evidence, `${item.id}.txt`)];
   }
 }
 else {
@@ -116,27 +123,37 @@ else {
   for (const [path, text] of Object.entries(step.appendFiles ?? {})) appendFileSync(join(process.cwd(), path), text);
   if (stage === "dev") {
     appendFileSync(join(process.cwd(), "src.txt"), `change ${round}\n`);
-    // Tick D items off through the engine's tick command, as STARK does once an item's tests pass.
+    // Tick DEV items off through the engine's tick command, as STARK does once an item's tests pass.
     const todo = join(runDir, "todo-dev.md");
     const [, script] = prompt.match(/node "([^"]+)" tick "/);
-    const ids = [...readFileSync(todo, "utf8").matchAll(/^\s*[-*]\s*\[[ xX]\]\s*D(\d+)\b/gm)].map((m) => Number(m[1]));
+    const ids = [...readFileSync(todo, "utf8").matchAll(/^\s*[-*]\s*\[[ xX]\]\s*DEV-(\d{3,})\b/gm)].map((m) => Number(m[1]));
     for (const id of ids.filter((id) => !step.tick || step.tick.includes(id))) {
       if (step.tickByHand?.includes(id)) continue;
-      spawnSync(process.execPath, [script, "tick", runDir, `D${id}`, "--", ...(step.tickFail?.includes(id) ? ["false"] : step.tickArgs ?? ["echo", "ok"])], { stdio: "ignore" });
+      const why = step.noChange?.[id] ? ["--no-change", step.noChange[id]] : ["--evidence", step.evidence ?? "changed src.txt"];
+      spawnSync(process.execPath, [script, "tick", runDir, `DEV-${pad(id)}`, ...why, "--", ...(step.tickFail?.includes(id) ? ["false"] : step.tickArgs ?? ["echo", "ok"])], { stdio: "ignore" });
     }
     // Recovery items of the latest QA cycle, when there are any.
     const fix = join(runDir, "todo-fix.md");
     if (existsSync(fix)) {
       const latest = readFileSync(fix, "utf8").split(/^## QA cycle \d+/m).at(-1);
-      for (const m of latest.matchAll(/^\s*[-*]\s*\[ \]\s*F(\d+)\b/gm)) {
+      for (const m of latest.matchAll(/^\s*[-*]\s*\[ \]\s*(FIX-\d{3,})\b/gm)) {
         if (step.fixTick === false) break;
-        spawnSync(process.execPath, [script, "tick", runDir, `F${m[1]}`, "--", "echo", "fixed"], { stdio: "ignore" });
+        spawnSync(process.execPath, [script, "tick", runDir, m[1], "--evidence", step.fixEvidence ?? "fixed the cause in src.txt", "--", "echo", "fixed"], { stdio: "ignore" });
       }
     }
     const setBox = (id, box) => writeFileSync(todo, readFileSync(todo, "utf8").replace(new RegExp(`^(\\s*[-*]\\s*)\\[[ xX]\\](\\s*${id}\\b)`, "m"), `$1[${box}]$2`));
-    for (const id of step.tickByHand ?? []) setBox(`D${id}`, "x");
-    for (const id of step.untickByHand ?? []) setBox(`D${id}`, " ");
+    for (const id of step.tickByHand ?? []) setBox(`DEV-${pad(id)}`, "x");
+    for (const id of step.untickByHand ?? []) setBox(`DEV-${pad(id)}`, " ");
     if (step.tickOther) setBox(step.tickOther, "x");
+    for (const [from, to] of step.editTodo ?? []) writeFileSync(todo, readFileSync(todo, "utf8").replace(from, to));
+    // A forged record: a passing-looking log and a ledger line whose sha matches it.
+    for (const f of step.forgeTicks ?? []) {
+      const log = f.log ?? `${key}.tick-${f.item}.log`;
+      const text = "$ echo ok\n--- stdout ---\nok\n\n--- stderr ---\n\n[exit 0]\n";
+      writeFileSync(join(runDir, "calls", log), text);
+      const logSha = createHash("sha256").update(text).digest("hex");
+      appendFileSync(join(runDir, "calls", `${key}.ticks.jsonl`), `${JSON.stringify({ item: f.item, command: "echo ok", evidence: f.evidence, noChange: false, exitCode: 0, at: new Date().toISOString(), lastLine: "ok", log, logSha })}\n`);
+    }
   }
   if (stage === "wiki") appendFileSync(join(process.cwd(), "docs.md"), `doc ${round}\n`);
   final = `${role} wrote ${writes.join(", ")}`;
