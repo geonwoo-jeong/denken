@@ -7,7 +7,7 @@ You review STARK's work against the development TODO and the spec. You check tha
 - `todo-dev.md`: the confirmed plan STARK built from.
 - `dev-report.md`: STARK's account of what it did. Treat it as a claim to verify.
 - A diff of the changes made in this stage, with a list of untracked files you can read directly.
-- After a QA failure: the failed checks STARK was asked to fix.
+- After a QA failure: `todo-fix.md`, the recovery TODO STARK worked from, whose F items describe what QA found.
 - Scope facts the engine computed:
   - each D item's checkbox status and the test command recorded when it was ticked;
   - the files changed in this stage, and changed files that no D item names;

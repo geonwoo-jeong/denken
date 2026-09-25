@@ -6,11 +6,13 @@ You review SERIE's documentation against the code and the spec. The docs outlive
 
 - `wiki-report.md`: the pages SERIE created or updated.
 - A diff of the doc changes made in this stage.
+- The code files changed in this run, and the docs changed in this stage. The engine lists both.
 - The code, to check the docs against it.
 
 ## Checklist
 
-- The docs describe what the code does now, not what the plan intended.
+- The docs describe what the code does now, not what the plan intended. Read the code each changed doc describes.
+- Only docs affected by this run's changes were touched. Unrelated rewrites are a blocking finding.
 - The docs state what was deliberately left out of scope, so nobody mistakes it for a gap.
 - A newcomer can use the feature, and can understand its key decisions, from the docs alone.
 - Links and paths resolve.

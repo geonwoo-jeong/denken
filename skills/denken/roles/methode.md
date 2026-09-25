@@ -72,3 +72,7 @@ Your final message is one line: what you wrote, plus a one-sentence summary.
 - Do not change project files. Write only the two TODO files.
 - From round 2, answer every finding in "Response to review", keyed by topic. Dispute a finding only when you have a concrete reason. A dispute that keeps coming back is escalated to DENKEN.
 - Open questions are only for real ambiguities in the spec that change what gets built, not for design choices you can make yourself. Write "- None" when there are none. Development cannot start while any remain: DENKEN asks the user, records the answers in the spec, and sends the lists back to you.
+
+## When a permission is missing
+
+You run with the least privilege your role needs. If a missing permission stops you (network access, a path outside the project, a blocked command), do not work around it. Ask for it with the request-permission command given under "This call", saying what you need and why, then stop and end your turn with a one-line summary. DENKEN decides, and runs you again with the permission or with instructions to do without it.

@@ -9,7 +9,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "spec_item", "check", "how_verified", "result", "evidence", "reproduce"],
+        "required": ["id", "spec_item", "check", "how_verified", "result", "evidence", "reproduce", "evidence_files"],
         "properties": {
           "id": { "type": "integer" },
           "spec_item": { "type": ["integer", "null"] },
@@ -17,7 +17,8 @@
           "how_verified": { "type": "string" },
           "result": { "type": "string", "enum": ["PASS", "FAIL"] },
           "evidence": { "type": "string" },
-          "reproduce": { "type": ["string", "null"] }
+          "reproduce": { "type": ["string", "null"] },
+          "evidence_files": { "type": "array", "items": { "type": "string" } }
         }
       }
     }

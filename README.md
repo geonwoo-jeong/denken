@@ -28,9 +28,10 @@ spec    DENKEN ⇄ you          spec.md: in scope (S1..), out of scope (X1..)
 plan    METHODE ⇄ RICHTER     todo-dev.md (D1..), todo-qa.md (Q1..)
         you confirm the scope and both TODO lists
 dev     STARK ⇄ UBEL          item by item: build, unit test, tick off (todo-dev.md only)
-qa      GENAU                 runs todo-qa.md; a failure goes back to dev
-wiki    SERIE ⇄ FRIEREN
-done    approved results only
+qa      GENAU                 runs todo-qa.md and saves evidence
+          fail → recovery TODO (todo-fix.md) → STARK fixes → UBEL approves → QA again
+wiki    SERIE ⇄ FRIEREN       only the docs affected by the files this run changed
+done    approved results only; the whole run is recorded in ai-log/
 ```
 
 | Name | Role | Default provider |
@@ -50,6 +51,8 @@ How it works:
 - **Read-only review:** reviewers are read-only. Claude gets only Read, Grep and Glob; Codex runs in its read-only sandbox. A review that changes a file is rejected.
 - **Approval gate:** a stage moves on only after its review has no blocking findings. The engine also checks that the TODO lists cover every in-scope item and nothing out of scope, and development waits for you to confirm them.
 - **Escalation:** DENKEN is called in when the same topic is raised 3 times, when progress stalls, or when a stage reaches 5 rounds.
+- **Permissions:** workers run with least privilege. One that needs more (network, a directory outside the project, a blocked command) asks through the engine and stops; DENKEN grants the minimum or denies it, and anything broad (all network, a directory outside the project) needs your explicit answer. Agent configuration (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`) and DENKEN's own files cannot be changed by any agent.
+- **Record:** every run is written to `ai-log/<date>/<NNN>_<time>_<name>/` as it goes: `00-request`, `01-planning`, `02-development`, `03-qa` (with evidence), `04-wiki`, `raw/` (every exchange) and `timeline.md` (every step, verdict, stop and resume). Raw exchanges and QA evidence are git-ignored by default, and a secret scan runs before DONE.
 - **Single provider:** with only Claude or only Codex installed, everything runs on that provider.
 
 ### Choosing which AI plays each role

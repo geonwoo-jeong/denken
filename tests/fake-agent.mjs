@@ -8,10 +8,15 @@
 //   tick          D ids STARK ticks off with the tick command (default: all of them)
 //   tickFail      D ids whose tick command fails (they stay unticked)
 //   tickArgs      the argv STARK passes to the tick command (default: echo ok)
+//   fixTick       false: STARK leaves the recovery (F) items unticked
 //   tickByHand    D ids STARK ticks by editing todo-dev.md directly, with no test run
 //   untickByHand  D ids STARK unticks by editing todo-dev.md directly
 //   tickOther     a non-D id (like "Q1") whose checkbox STARK ticks by hand in the TODO section
-//   editFiles     { path: content } STARK writes in the project before ticking
+//   editFiles     { path: content } a worker writes in the project (STARK: before ticking)
+//   removeFiles   paths a worker deletes from the project
+//   appendFiles   { path: text } a worker appends to files in the project
+//   requestPermission { need, why }: ask DENKEN for a permission, then stop
+//   evidenceText  extra text GENAU puts in each evidence file
 //   report        text STARK writes to dev-report.md
 //   touch         a path to append to, relative to the project ("$RUN" is the run directory)
 //   fail          exit 1 with this text on stderr
@@ -21,7 +26,7 @@
 //   staleMeta     write a result file from another attempt of this call before answering
 // Each call is logged as "<cli> <key> <ro|rw> <net|nonet|->".
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 export const DEFAULT_TODO_DEV = "# Development TODO\n\n## Acceptance\n- S1. One. Done when: one works.\n- S2. Two. Done when: two works.\n\n## Do not build\n- X1. Three.\n\n## TODO\n- [ ] D1 (S1) build one\n- [ ] D2 (S2) build two\n\n## Open questions\n- None\n";
@@ -30,6 +35,10 @@ const pass = (id) => ({ id, spec_item: id, check: `check ${id}`, how_verified: "
 
 const cli = basename(process.argv[1]);
 const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log(`${cli} 0.0.0-fake`);
+  process.exit(0);
+}
 const prompt = readFileSync(0, "utf8");
 const scenarioPath = process.env.FAKE_SCENARIO;
 const scenario = JSON.parse(readFileSync(scenarioPath, "utf8"));
@@ -50,6 +59,7 @@ const counts = existsSync(countsPath) ? JSON.parse(readFileSync(countsPath, "utf
 const attempt = (counts[key] = (counts[key] ?? 0) + 1);
 writeFileSync(countsPath, JSON.stringify(counts));
 appendFileSync(`${scenarioPath}.log`, `${cli} ${key} ${readOnly ? "ro" : "rw"} ${network}\n`);
+appendFileSync(`${scenarioPath}.args.jsonl`, `${JSON.stringify({ key, attempt, args })}\n`);
 
 const entry = scenario[key];
 const step = (Array.isArray(entry) ? entry[attempt - 1] : entry) ?? {};
@@ -75,8 +85,22 @@ if (step.fail) {
 }
 
 let final;
-if (["richter", "ubel", "frieren"].includes(role)) final = step.review ?? { verdict: "APPROVED", findings: [], checked: ["fake review"] };
-else if (role === "genau") final = step.qa ?? { result: "PASS", items: [pass(1), pass(2)] };
+if (step.requestPermission) {
+  // Ask DENKEN for a permission through the engine, then stop, as the role files say.
+  const [, script] = prompt.match(/node "([^"]+)" request-permission "/);
+  spawnSync(process.execPath, [script, "request-permission", runDir, "--need", step.requestPermission.need, "--why", step.requestPermission.why], { stdio: "ignore" });
+  final = `stopped: asked for ${step.requestPermission.need}`;
+} else if (["richter", "ubel", "frieren"].includes(role)) final = step.review ?? { verdict: "APPROVED", findings: [], checked: ["fake review"] };
+else if (role === "genau") {
+  // Leave an evidence file per item, as GENAU does, and point to it from the report.
+  final = step.qa ?? { result: "PASS", items: [pass(1), pass(2)] };
+  const evidence = join(runDir, "calls", `${key}.evidence`);
+  mkdirSync(evidence, { recursive: true });
+  for (const item of final.items) {
+    writeFileSync(join(evidence, `q${item.id}.txt`), `Q${item.id}: ${item.result}\n${step.evidenceText ?? ""}`);
+    item.evidence_files = [join(evidence, `q${item.id}.txt`)];
+  }
+}
 else {
   const writes = (prompt.match(/- Write:\n((?: {2}- .+\n?)+)/)?.[1] ?? "").split("\n").map((l) => l.replace(/^ {2}- /, "").trim()).filter(Boolean);
   for (const file of writes) {
@@ -84,12 +108,14 @@ else {
     const content = name === "todo-dev.md" ? step.todoDev ?? DEFAULT_TODO_DEV : name === "todo-qa.md" ? step.todoQa ?? DEFAULT_TODO_QA : name === "dev-report.md" && step.report ? step.report : `# ${role} round ${round}\n`;
     writeFileSync(file, content);
   }
+  for (const [path, content] of Object.entries(step.editFiles ?? {})) {
+    mkdirSync(dirname(join(process.cwd(), path)), { recursive: true });
+    writeFileSync(join(process.cwd(), path), content);
+  }
+  for (const path of step.removeFiles ?? []) rmSync(join(process.cwd(), path), { force: true });
+  for (const [path, text] of Object.entries(step.appendFiles ?? {})) appendFileSync(join(process.cwd(), path), text);
   if (stage === "dev") {
     appendFileSync(join(process.cwd(), "src.txt"), `change ${round}\n`);
-    for (const [path, content] of Object.entries(step.editFiles ?? {})) {
-      mkdirSync(dirname(join(process.cwd(), path)), { recursive: true });
-      writeFileSync(join(process.cwd(), path), content);
-    }
     // Tick D items off through the engine's tick command, as STARK does once an item's tests pass.
     const todo = join(runDir, "todo-dev.md");
     const [, script] = prompt.match(/node "([^"]+)" tick "/);
@@ -97,6 +123,15 @@ else {
     for (const id of ids.filter((id) => !step.tick || step.tick.includes(id))) {
       if (step.tickByHand?.includes(id)) continue;
       spawnSync(process.execPath, [script, "tick", runDir, `D${id}`, "--", ...(step.tickFail?.includes(id) ? ["false"] : step.tickArgs ?? ["echo", "ok"])], { stdio: "ignore" });
+    }
+    // Recovery items of the latest QA cycle, when there are any.
+    const fix = join(runDir, "todo-fix.md");
+    if (existsSync(fix)) {
+      const latest = readFileSync(fix, "utf8").split(/^## QA cycle \d+/m).at(-1);
+      for (const m of latest.matchAll(/^\s*[-*]\s*\[ \]\s*F(\d+)\b/gm)) {
+        if (step.fixTick === false) break;
+        spawnSync(process.execPath, [script, "tick", runDir, `F${m[1]}`, "--", "echo", "fixed"], { stdio: "ignore" });
+      }
     }
     const setBox = (id, box) => writeFileSync(todo, readFileSync(todo, "utf8").replace(new RegExp(`^(\\s*[-*]\\s*)\\[[ xX]\\](\\s*${id}\\b)`, "m"), `$1[${box}]$2`));
     for (const id of step.tickByHand ?? []) setBox(`D${id}`, "x");
