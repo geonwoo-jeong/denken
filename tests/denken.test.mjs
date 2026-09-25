@@ -7,6 +7,10 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+// A git hook that runs these tests (pre-push does) sets GIT_DIR and friends. Every git command the
+// tests start would then act on the repository being pushed instead of a test's own.
+for (const key of Object.keys(process.env)) if (key.startsWith("GIT_")) delete process.env[key];
+
 const here = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = join(here, "..", "skills", "denken", "scripts");
 const FAKE = join(here, "fake-agent.mjs");
@@ -26,7 +30,10 @@ function setup(scenario = {}, config = null) {
   for (const cli of ["claude", "codex"]) symlinkSync(FAKE, join(bin, cli));
   const scenarioPath = join(dir, "scenario.json");
   writeFileSync(scenarioPath, JSON.stringify(scenario));
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_SCENARIO: scenarioPath, DENKEN_SKIP_AUTH_CHECK: "1", XDG_CONFIG_HOME: join(dir, "xdg"), DENKEN_WORKTREES: join(dir, "worktrees") };
+  // Git variables inherited from a hook (a pre-push hook running these tests sets GIT_DIR) would
+  // point every git command here at the repository being pushed.
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
+  const env = { ...inherited, PATH: `${bin}:${process.env.PATH}`, FAKE_SCENARIO: scenarioPath, DENKEN_SKIP_AUTH_CHECK: "1", XDG_CONFIG_HOME: join(dir, "xdg"), DENKEN_WORKTREES: join(dir, "worktrees") };
   const sh = (cmd, ...args) => spawnSync(cmd, args, { cwd: proj, env, encoding: "utf8" });
   sh("git", "init", "-q");
   writeFileSync(join(proj, "a.txt"), "a\n");
@@ -80,7 +87,7 @@ function setup(scenario = {}, config = null) {
     writeFileSync(join(proj, run, "units.md"), `# Units\n\n${units}`);
   };
   const worktrees = () => sh("git", "worktree", "list", "--porcelain").stdout.split("\n").filter((l) => l.startsWith("worktree ")).length;
-  return { dir, proj, run, sh, node, denken, drive, calls, callsFull, argsOf, state, split, worktrees };
+  return { dir, proj, run, env, sh, node, denken, drive, calls, callsFull, argsOf, state, split, worktrees };
 }
 const TWO_UNITS = "- UNIT-1 (REQ-001) One. Scope: `a/`.\n- UNIT-2 (REQ-002) Two. Scope: `b/`.\n";
 
@@ -1200,4 +1207,30 @@ test("units: a failure found after the merge is fixed in the project, reviewed a
   assert.deepEqual(t.calls().slice(-7), ["claude dev-ubel-1 ro", "claude qa-genau-1 rw", "codex dev-stark-2 rw", "claude dev-ubel-2 ro", "claude qa-genau-2 rw", "claude wiki-serie-1 rw", "codex wiki-frieren-1 ro"]);
   assert.match(readFileSync(join(t.proj, t.run, "todo-fix.md"), "utf8"), /- \[x\] FIX-001 \(QA-101, REQ-001\) Fix: one/);
   assert.match(readFileSync(join(t.proj, t.run, "todo-dev.md"), "utf8"), /- \[x\] DEV-101 \(REQ-001\)[^\n]*\n {2}Evidence: changed src\.txt/);
+});
+
+test("an inherited GIT_DIR (as in a git hook) does not point the tests or the engine at another repository", () => {
+  const outer = mkdtempSync(join(tmpdir(), "denken-outer-"));
+  spawnSync("git", ["init", "-q"], { cwd: outer });
+  const before = readFileSync(join(outer, ".git", "config"), "utf8");
+  const objects = () => readdirSync(join(outer, ".git", "objects")).filter((d) => /^[0-9a-f]{2}$/.test(d)).length;
+  // The test harness drops it...
+  process.env.GIT_DIR = join(outer, ".git");
+  let t;
+  try {
+    t = setup();
+  } finally {
+    delete process.env.GIT_DIR;
+  }
+  // ...and so does the engine, when it is handed one directly.
+  const engine = (...args) => JSON.parse(spawnSync(process.execPath, [join(SCRIPTS, "denken.mjs"), ...args], { cwd: t.proj, env: { ...t.env, GIT_DIR: join(outer, ".git") }, encoding: "utf8" }).stdout);
+  assert.equal(engine("start", t.run).action, "started");
+  let r;
+  for (let i = 0; i < 20 && r?.action !== "done"; i++) {
+    r = engine("next", t.run, "--wait", "60");
+    if (r.reason === "confirm_todos") engine("confirm", t.run, "--user-said", "Go.");
+  }
+  assert.equal(r.action, "done");
+  assert.equal(readFileSync(join(outer, ".git", "config"), "utf8"), before);
+  assert.equal(objects(), 0);
 });
